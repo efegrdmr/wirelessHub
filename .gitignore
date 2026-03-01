@@ -1,0 +1,40 @@
+# ── Build output ──────────────────────────────────────────────────────────────
+daemon/build/
+
+# ── CMake generated files ─────────────────────────────────────────────────────
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+install_manifest.txt
+CTestTestfile.cmake
+
+# ── Compiled binaries ─────────────────────────────────────────────────────────
+*.o
+*.a
+*.so
+*.so.*
+*.out
+*.elf
+
+# ── Runtime / socket files ────────────────────────────────────────────────────
+/tmp/wirelesshub.sock
+
+# ── Editor / IDE ──────────────────────────────────────────────────────────────
+.vscode/settings.json
+.vscode/launch.json
+.vscode/c_cpp_properties.json
+*.swp
+*.swo
+*~
+.idea/
+*.iml
+
+# ── OS ────────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── Logs / debug dumps ────────────────────────────────────────────────────────
+*.log
+core
+core.*
