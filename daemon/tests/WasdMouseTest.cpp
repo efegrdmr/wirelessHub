@@ -1,27 +1,60 @@
 // tests/WasdMouseTest.cpp
-// Fake ESP32: connects to the daemon's Unix socket and identifies as a HID mouse.
-// The daemon calls vhci.attach() with the accepted fd, so the kernel speaks
-// USB/IP directly to this process.  WASD keys → cursor movement.
+// Fake ESP32: speaks the WirelessHub UDP protocol to the daemon.
+// Sends a DEVICE_EVENT CONNECT, then bridges raw USB/IP bytes wrapped in
+// RAW_DATA headers. WASD keys → cursor movement.
+//
+// Transport:  UDP
+//   device listens on: 0.0.0.0:7789  (reply_port in DEVICE_EVENT)
+//   daemon  listens on: 127.0.0.1:7788
 //
 // Build: see CMakeLists.txt (target wasd_mouse_test)
-// Run:   sudo ./build/wasd_mouse_test     (needs vhci + daemon already running)
+// Run:   sudo ./build/wasd_mouse_test
+
+#include "protocol/Protocol.h"
 
 #include <cstdio>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <csignal>
 #include <cerrno>
 #include <vector>
-#include <arpa/inet.h>   // ntohl / htonl
+#include <arpa/inet.h>
 #include <sys/socket.h>
-#include <sys/un.h>
 #include <sys/epoll.h>
-#include <sys/uio.h>     // writev
+#include <sys/uio.h>
 #include <termios.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <netinet/in.h>
 
-// ── USB/IP wire structs (matches kernel docs) ──────────────────────────────
+// ── UDP transport globals ──────────────────────────────────────────────────
+
+static int         g_udp_fd   = -1;
+static sockaddr_in g_daemon_addr{};
+static uint8_t     g_udp_seq  = 0;
+static uint8_t     MY_DEVICE_ID = 0x00;   // overridden by argv[1]
+
+// Wrap payload in a WirelessHub RAW_DATA header and send via UDP to the daemon.
+static void udpSend(const uint8_t* payload, size_t len)
+{
+    Header hdr{};
+    hdr.cmd_type    = static_cast<uint8_t>(CmdType::RAW_DATA);
+    hdr.device_id   = MY_DEVICE_ID;
+    hdr.endpoint    = 0x00;
+    hdr.seq         = g_udp_seq++;
+    hdr.payload_len = static_cast<uint16_t>(len);
+
+    // Combine into one UDP datagram
+    std::vector<uint8_t> pkt(sizeof(hdr) + len);
+    memcpy(pkt.data(),              &hdr, sizeof(hdr));
+    if (len) memcpy(pkt.data() + sizeof(hdr), payload, len);
+
+    sendto(g_udp_fd, pkt.data(), pkt.size(), 0,
+           reinterpret_cast<const sockaddr*>(&g_daemon_addr), sizeof(g_daemon_addr));
+}
+
+// ── USB/IP wire structs ────────────────────────────────────────────────────
 
 static constexpr uint32_t USBIP_CMD_SUBMIT = 0x00000001;
 static constexpr uint32_t USBIP_CMD_UNLINK = 0x00000002;
@@ -60,103 +93,32 @@ struct UsbipRetSubmit {
 
 // ── HID descriptors ────────────────────────────────────────────────────────
 
-// HID Report Descriptor: 3-button relative mouse (52 bytes)
 static const uint8_t HID_REPORT_DESC[] = {
-    0x05, 0x01,  // Usage Page (Generic Desktop)
-    0x09, 0x02,  // Usage (Mouse)
-    0xA1, 0x01,  // Collection (Application)
-    0x09, 0x01,  //   Usage (Pointer)
-    0xA1, 0x00,  //   Collection (Physical)
-    // Buttons
-    0x05, 0x09,  //     Usage Page (Button)
-    0x19, 0x01,  //     Usage Minimum (1)
-    0x29, 0x03,  //     Usage Maximum (3)
-    0x15, 0x00,  //     Logical Minimum (0)
-    0x25, 0x01,  //     Logical Maximum (1)
-    0x95, 0x03,  //     Report Count (3)
-    0x75, 0x01,  //     Report Size (1)
-    0x81, 0x02,  //     Input (Data, Variable, Absolute)
-    // Padding (5 bits)
-    0x95, 0x01,  //     Report Count (1)
-    0x75, 0x05,  //     Report Size (5)
-    0x81, 0x03,  //     Input (Constant)
-    // X, Y, Wheel (relative, 8-bit signed)
-    0x05, 0x01,  //     Usage Page (Generic Desktop)
-    0x09, 0x30,  //     Usage (X)
-    0x09, 0x31,  //     Usage (Y)
-    0x09, 0x38,  //     Usage (Wheel)
-    0x15, 0x81,  //     Logical Minimum (-127)
-    0x25, 0x7F,  //     Logical Maximum (127)
-    0x75, 0x08,  //     Report Size (8)
-    0x95, 0x03,  //     Report Count (3)
-    0x81, 0x06,  //     Input (Data, Variable, Relative)
-    0xC0,        //   End Collection
-    0xC0,        // End Collection
+    0x05, 0x01,  0x09, 0x02,  0xA1, 0x01,  0x09, 0x01,  0xA1, 0x00,
+    0x05, 0x09,  0x19, 0x01,  0x29, 0x03,  0x15, 0x00,  0x25, 0x01,
+    0x95, 0x03,  0x75, 0x01,  0x81, 0x02,
+    0x95, 0x01,  0x75, 0x05,  0x81, 0x03,
+    0x05, 0x01,  0x09, 0x30,  0x09, 0x31,  0x09, 0x38,
+    0x15, 0x81,  0x25, 0x7F,  0x75, 0x08,  0x95, 0x03,  0x81, 0x06,
+    0xC0, 0xC0,
 };
-static constexpr uint8_t HID_REPORT_DESC_LEN = sizeof(HID_REPORT_DESC); // 52
+static constexpr uint8_t HID_REPORT_DESC_LEN = sizeof(HID_REPORT_DESC);
 
-// Device Descriptor (18 bytes) – class/subclass at interface level
 static const uint8_t DEVICE_DESC[] = {
-    0x12,        // bLength
-    0x01,        // bDescriptorType (Device)
-    0x00, 0x02,  // bcdUSB (2.00)
-    0x00,        // bDeviceClass (0 = per-interface)
-    0x00,        // bDeviceSubClass
-    0x00,        // bDeviceProtocol
-    0x40,        // bMaxPacketSize0 (64)
-    0x34, 0x12,  // idVendor  (0x1234 – generic test)
-    0x78, 0x56,  // idProduct (0x5678 – generic test)
-    0x00, 0x01,  // bcdDevice (1.00)
-    0x00,        // iManufacturer
-    0x00,        // iProduct
-    0x00,        // iSerialNumber
-    0x01,        // bNumConfigurations
+    0x12, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x40,
+    0x34, 0x12,  // idVendor  0x1234
+    0x78, 0x56,  // idProduct 0x5678
+    0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
 };
 
-// Full Configuration Descriptor (9 + 9 + 9 + 7 = 34 bytes)
 static const uint8_t CONFIG_DESC[] = {
-    // Configuration Descriptor
-    0x09,        // bLength
-    0x02,        // bDescriptorType (Config)
-    0x22, 0x00,  // wTotalLength (34)
-    0x01,        // bNumInterfaces
-    0x01,        // bConfigurationValue
-    0x00,        // iConfiguration
-    0xA0,        // bmAttributes (bus-powered, remote wakeup)
-    0x32,        // bMaxPower (100 mA)
-    // Interface Descriptor
-    0x09,        // bLength
-    0x04,        // bDescriptorType (Interface)
-    0x00,        // bInterfaceNumber
-    0x00,        // bAlternateSetting
-    0x01,        // bNumEndpoints
-    0x03,        // bInterfaceClass (HID)
-    0x01,        // bInterfaceSubClass (Boot)
-    0x02,        // bInterfaceProtocol (Mouse)
-    0x00,        // iInterface
-    // HID Descriptor
-    0x09,        // bLength
-    0x21,        // bDescriptorType (HID)
-    0x11, 0x01,  // bcdHID (1.11)
-    0x00,        // bCountryCode
-    0x01,        // bNumDescriptors
-    0x22,        // bDescriptorType for subordinate (Report)
-    HID_REPORT_DESC_LEN, 0x00,  // wDescriptorLength (little-endian)
-    // Endpoint Descriptor – Interrupt IN, endpoint 1
-    0x07,        // bLength
-    0x05,        // bDescriptorType (Endpoint)
-    0x81,        // bEndpointAddress (IN | 1)
-    0x03,        // bmAttributes (Interrupt)
-    0x04, 0x00,  // wMaxPacketSize (4 bytes)
-    0x0A,        // bInterval (10 ms)
+    0x09, 0x02, 0x22, 0x00, 0x01, 0x01, 0x00, 0xA0, 0x32,
+    0x09, 0x04, 0x00, 0x00, 0x01, 0x03, 0x01, 0x02, 0x00,
+    0x09, 0x21, 0x11, 0x01, 0x00, 0x01, 0x22, HID_REPORT_DESC_LEN, 0x00,
+    0x07, 0x05, 0x81, 0x03, 0x04, 0x00, 0x0A,
 };
 
-// Language ID descriptor (String 0)
-static const uint8_t STRING_LANG_DESC[] = {
-    0x04,        // bLength
-    0x03,        // bDescriptorType (String)
-    0x09, 0x04,  // wLANGID[0] = 0x0409 (English US)
-};
+static const uint8_t STRING_LANG_DESC[] = { 0x04, 0x03, 0x09, 0x04 };
 
 // ── Mouse state ────────────────────────────────────────────────────────────
 
@@ -166,7 +128,6 @@ static int8_t        g_dy       = 0;
 static uint8_t       g_buttons  = 0;
 
 static termios g_old_termios{};
-
 static void restoreTerminal() { tcsetattr(STDIN_FILENO, TCSANOW, &g_old_termios); }
 static void onSignal(int)     { g_running = false; restoreTerminal(); }
 
@@ -174,117 +135,62 @@ static void onSignal(int)     { g_running = false; restoreTerminal(); }
 
 static const char* descTypeName(uint8_t t) {
     switch (t) {
-    case 0x01: return "DEVICE";
-    case 0x02: return "CONFIG";
-    case 0x03: return "STRING";
-    case 0x04: return "INTERFACE";
-    case 0x05: return "ENDPOINT";
-    case 0x06: return "DEVICE_QUALIFIER";
-    case 0x07: return "OTHER_SPEED_CONFIG";
-    case 0x0F: return "BOS";
-    case 0x21: return "HID";
-    case 0x22: return "HID_REPORT";
-    default:   return "?";
+    case 0x01: return "DEVICE";    case 0x02: return "CONFIG";
+    case 0x03: return "STRING";    case 0x21: return "HID";
+    case 0x22: return "HID_REPORT"; default: return "?";
     }
 }
 
-static void logSetup(const uint8_t* s) {
-    printf("  setup: %02X %02X %02X %02X %02X %02X %02X %02X"
-           "  (bmReqType=%02X bReq=%02X wVal=%04X wIdx=%04X wLen=%u)\n",
-           s[0],s[1],s[2],s[3],s[4],s[5],s[6],s[7],
-           s[0], s[1],
-           static_cast<uint16_t>(s[2] | (s[3]<<8)),
-           static_cast<uint16_t>(s[4] | (s[5]<<8)),
-           static_cast<uint16_t>(s[6] | (s[7]<<8)));
-}
-
-static void sendRetSubmit(int fd, uint32_t seqnum, int status,
-                          const uint8_t* payload, uint32_t payload_len) {
+// Send a USB/IP reply wrapped in a WirelessHub RAW_DATA UDP packet.
+static void sendRetSubmit(int /*unused*/, uint32_t seqnum, int status,
+                          const uint8_t* payload, uint32_t payload_len)
+{
     UsbipRetSubmit ret{};
     ret.basic.command   = htonl(USBIP_RET_SUBMIT);
     ret.basic.seqnum    = htonl(seqnum);
     ret.status          = htonl(static_cast<uint32_t>(status));
     ret.actual_length   = htonl(payload_len);
 
-    // Log outgoing reply
-    if (payload_len > 0 && payload) {
-        printf("  <<< REPLY seq=%-4u status=%-4d len=%u  data:", seqnum, status, payload_len);
-        for (uint32_t i = 0; i < payload_len && i < 16; ++i)
-            printf(" %02X", payload[i]);
-        if (payload_len > 16) printf(" ...");
-        printf("\n");
-    } else {
-        printf("  <<< REPLY seq=%-4u status=%d (no payload)\n", seqnum, status);
-    }
-    fflush(stdout);
+    // Pack RET_SUBMIT header + optional payload, then send via UDP
+    std::vector<uint8_t> usbip_pkt(sizeof(ret) + payload_len);
+    memcpy(usbip_pkt.data(), &ret, sizeof(ret));
+    if (payload && payload_len) memcpy(usbip_pkt.data() + sizeof(ret), payload, payload_len);
 
-    // Send header + payload atomically with writev so the kernel sees one
-    // complete USB/IP reply in a single TCP segment, avoiding partial-read issues.
-    if (payload && payload_len > 0) {
-        struct iovec iov[2];
-        iov[0].iov_base = &ret;
-        iov[0].iov_len  = sizeof(ret);
-        iov[1].iov_base = const_cast<uint8_t*>(payload);
-        iov[1].iov_len  = payload_len;
-        if (writev(fd, iov, 2) < 0) perror("[test] writev");
-    } else {
-        if (write(fd, &ret, sizeof(ret)) < 0) perror("[test] write header");
-    }
+    udpSend(usbip_pkt.data(), usbip_pkt.size());
 }
 
-// Clip descriptor to the wLength requested (little-endian in setup[6,7])
 static uint16_t getWLength(const uint8_t* setup) {
-    return static_cast<uint16_t>(setup[6] | (setup[7] << 8));
+    return uint16_t(setup[6] | (setup[7] << 8));
 }
 
-static void handleControlIn(int fd, uint32_t seqnum, const uint8_t* setup) {
-    uint8_t  req_type = setup[0];
-    uint8_t  bRequest = setup[1];
-    uint8_t  desc_idx = setup[2];
-    uint8_t  desc_type= setup[3];
+static void handleControlIn(int fd, uint32_t seqnum, const uint8_t* setup)
+{
+    uint8_t  req_type = setup[0]; uint8_t bRequest = setup[1];
+    uint8_t  desc_idx = setup[2]; uint8_t desc_type = setup[3];
     uint16_t wLength  = getWLength(setup);
 
-    // ── Standard GET_DESCRIPTOR ──────────────────────────────────────────
     if (bRequest == 0x06) {
-        const uint8_t* desc     = nullptr;
-        uint16_t       desc_len = 0;
+        const uint8_t* desc = nullptr; uint16_t desc_len = 0;
 
-        if (req_type == 0x80) {           // Standard, Device
+        if (req_type == 0x80) {
             switch (desc_type) {
-            case 0x01:                    // Device Descriptor
-                desc = DEVICE_DESC;  desc_len = sizeof(DEVICE_DESC);  break;
-            case 0x02:                    // Configuration Descriptor
-                desc = CONFIG_DESC;  desc_len = sizeof(CONFIG_DESC);  break;
-            case 0x03:                    // String Descriptor
+            case 0x01: desc = DEVICE_DESC;      desc_len = sizeof(DEVICE_DESC); break;
+            case 0x02: desc = CONFIG_DESC;      desc_len = sizeof(CONFIG_DESC); break;
+            case 0x03:
                 if (desc_idx == 0) { desc = STRING_LANG_DESC; desc_len = sizeof(STRING_LANG_DESC); break; }
-                // String idx > 0: STALL (no strings defined)
-                printf(">>> CTRL IN  seq=%-4u GET_DESCRIPTOR STRING idx=%u → STALL\n", seqnum, desc_idx);
-                sendRetSubmit(fd, seqnum, -32, nullptr, 0);
-                return;
-            case 0x06:                    // Device Qualifier (USB 2.0 high-speed)
-            case 0x07:                    // Other Speed Config
-            case 0x0F:                    // BOS
-                // Not supported on a full-speed device → STALL
-                printf(">>> CTRL IN  seq=%-4u GET_DESCRIPTOR %s → STALL (not supported)\n",
-                       seqnum, descTypeName(desc_type));
-                sendRetSubmit(fd, seqnum, -32, nullptr, 0);
-                return;
-            default: break;
+                sendRetSubmit(fd, seqnum, -32, nullptr, 0); return;
+            default:
+                sendRetSubmit(fd, seqnum, -32, nullptr, 0); return;
             }
-        } else if (req_type == 0x81) {    // Standard, Interface
-            if (desc_type == 0x22) {      // HID Report Descriptor
-                desc = HID_REPORT_DESC;  desc_len = HID_REPORT_DESC_LEN;
-            }
+        } else if (req_type == 0x81 && desc_type == 0x22) {
+            desc = HID_REPORT_DESC; desc_len = HID_REPORT_DESC_LEN;
         }
 
         if (desc && desc_len > 0) {
             uint16_t send_len = (wLength < desc_len) ? wLength : desc_len;
-            printf(">>> CTRL IN  seq=%-4u GET_DESCRIPTOR %s idx=%u wLen=%u → %u bytes\n",
-                   seqnum, descTypeName(desc_type), desc_idx, wLength, send_len);
+            if (desc_type == 0x01 || desc_type == 0x02 || desc_type == 0x22)
+                printf("  GET_DESCRIPTOR %s\n", descTypeName(desc_type));
             sendRetSubmit(fd, seqnum, 0, desc, send_len);
-            // Print a banner when HID Report Descriptor is sent — this is the
-            // last enumeration step; after this the kernel loads the HID driver
-            // and starts sending Interrupt IN polls on ep=1.
             if (desc_type == 0x22) {
                 printf("\n====================================================\n");
                 printf("  HID REPORT DESCRIPTOR sent — enumeration complete!\n");
@@ -295,281 +201,225 @@ static void handleControlIn(int fd, uint32_t seqnum, const uint8_t* setup) {
             }
             return;
         }
-        // GET_DESCRIPTOR for unhandled type
-        printf(">>> CTRL IN  seq=%-4u GET_DESCRIPTOR type=0x%02X(%s) idx=%u → STALL\n",
-               seqnum, desc_type, descTypeName(desc_type), desc_idx);
         sendRetSubmit(fd, seqnum, -32, nullptr, 0);
         return;
     }
-
-    // ── GET_CONFIGURATION ────────────────────────────────────────────────
     if (req_type == 0x80 && bRequest == 0x08) {
-        printf(">>> CTRL IN  seq=%-4u GET_CONFIGURATION\n", seqnum);
-        uint8_t val = 0x01;
-        sendRetSubmit(fd, seqnum, 0, &val, 1);
-        return;
+        uint8_t val = 0x01; sendRetSubmit(fd, seqnum, 0, &val, 1); return;
     }
-
-    // ── GET_INTERFACE ────────────────────────────────────────────────────
     if (req_type == 0x81 && bRequest == 0x0A) {
-        printf(">>> CTRL IN  seq=%-4u GET_INTERFACE\n", seqnum);
-        uint8_t val = 0x00;
-        sendRetSubmit(fd, seqnum, 0, &val, 1);
-        return;
+        uint8_t val = 0x00; sendRetSubmit(fd, seqnum, 0, &val, 1); return;
     }
-
-    // Unknown IN request – STALL
-    printf(">>> CTRL IN  seq=%-4u UNKNOWN req_type=0x%02X bRequest=0x%02X → STALL\n",
-           seqnum, req_type, bRequest);
-    logSetup(setup);
+    printf("  CTRL IN  UNKNOWN req_type=0x%02X bRequest=0x%02X → STALL\n",
+           req_type, bRequest);
     sendRetSubmit(fd, seqnum, -32, nullptr, 0);
 }
 
-static const char* outRequestName(uint8_t req_type, uint8_t bReq) {
-    if (req_type == 0x00) {
-        switch (bReq) {
-        case 0x05: return "SET_ADDRESS";
-        case 0x09: return "SET_CONFIGURATION";
-        default:   break;
-        }
-    }
-    if (req_type == 0x01) { if (bReq == 0x0B) return "SET_INTERFACE"; }
-    if (req_type == 0x21) {
-        switch (bReq) {
-        case 0x09: return "HID_SET_REPORT";
-        case 0x0A: return "HID_SET_IDLE";
-        case 0x0B: return "HID_SET_PROTOCOL";
-        default:   break;
-        }
-    }
-    return "?";
-}
-
 static void handleControlOut(int fd, uint32_t seqnum, const uint8_t* setup) {
-    uint8_t req_type = setup[0];
-    uint8_t bRequest = setup[1];
-    printf(">>> CTRL OUT seq=%-4u %s (req_type=0x%02X bReq=0x%02X) → ACK\n",
-           seqnum, outRequestName(req_type, bRequest), req_type, bRequest);
+    // Log only SET_CONFIGURATION (bReq=0x09) — the key enumeration step
+    if (setup[1] == 0x09)
+        printf("  SET_CONFIGURATION(%u)\n", setup[2]);
     sendRetSubmit(fd, seqnum, 0, nullptr, 0);
 }
 
 static void handleInterruptIn(int fd, uint32_t seqnum) {
-    // HID mouse report: [buttons, X, Y, wheel]
-    uint8_t report[4] = {
-        g_buttons,
-        static_cast<uint8_t>(g_dx),
-        static_cast<uint8_t>(g_dy),
-        0x00
-    };
-    // Only log when there's actual movement to avoid flooding the terminal
-    if (g_dx != 0 || g_dy != 0 || g_buttons != 0) {
-        printf(">>> INT  IN  seq=%-4u ep=1 SENDING mouse report: btn=%u dx=%d dy=%d\n",
-               seqnum, g_buttons,
-               static_cast<int>(static_cast<int8_t>(g_dx)),
-               static_cast<int>(static_cast<int8_t>(g_dy)));
+    uint8_t report[4] = { g_buttons, uint8_t(g_dx), uint8_t(g_dy), 0x00 };
+    if (g_dx || g_dy || g_buttons) {
+        printf(">>> INT  IN  seq=%-4u ep=1 mouse: btn=%u dx=%d dy=%d\n",
+               seqnum, g_buttons, int(int8_t(g_dx)), int(int8_t(g_dy)));
         fflush(stdout);
     }
-    g_dx = 0;
-    g_dy = 0;
+    g_dx = 0; g_dy = 0;
     sendRetSubmit(fd, seqnum, 0, report, sizeof(report));
 }
 
-// Process one raw USB/IP packet received on sock_fd
-static void dispatchUsbip(int sock_fd, const uint8_t* buf, size_t len) {
-    if (len < sizeof(UsbipCmdSubmit)) {
-        printf("[test] packet too small (%zu), ignoring\n", len);
-        return;
-    }
+static void dispatchUsbip(int fd, const uint8_t* buf, size_t len) {
+    if (len < sizeof(UsbipCmdSubmit)) { printf("[test] too-short usbip pkt\n"); return; }
 
     UsbipCmdSubmit cmd;
     memcpy(&cmd, buf, sizeof(cmd));
-
     uint32_t command   = ntohl(cmd.basic.command);
     uint32_t seqnum    = ntohl(cmd.basic.seqnum);
     uint32_t direction = ntohl(cmd.basic.direction);
     uint32_t ep        = ntohl(cmd.basic.ep);
 
     if (command == USBIP_CMD_UNLINK) {
-        // The kernel wants to cancel a pending URB. We must reply with
-        // RET_UNLINK or the kernel's USB subsystem will deadlock.
-        uint32_t unlink_seq;
-        memcpy(&unlink_seq, buf + 20, 4);  // bytes 20-23 = unlink_seqnum
-        unlink_seq = ntohl(unlink_seq);
-        printf("[UNLINK] seq=%-4u cancelling seq=%u → ACK\n", seqnum, unlink_seq);
-        fflush(stdout);
-
-        // RET_UNLINK: 48-byte reply, same layout as RET_SUBMIT but command=0x04
+        uint32_t unlink_seq; memcpy(&unlink_seq, buf + 20, 4); unlink_seq = ntohl(unlink_seq);
+        (void)unlink_seq;
         uint8_t reply[48] = {};
-        uint32_t cmd_be   = htonl(USBIP_RET_UNLINK);
-        uint32_t seq_be   = htonl(seqnum);
-        uint32_t status_be = htonl(0);
-        memcpy(reply +  0, &cmd_be,    4);
-        memcpy(reply +  4, &seq_be,    4);
-        memcpy(reply + 20, &status_be, 4);
-        if (write(sock_fd, reply, sizeof(reply)) < 0) perror("[test] write RET_UNLINK");
+        uint32_t v;
+        v = htonl(USBIP_RET_UNLINK); memcpy(reply +  0, &v, 4);
+        v = htonl(seqnum);           memcpy(reply +  4, &v, 4);
+        v = htonl(0);                memcpy(reply + 20, &v, 4);
+        udpSend(reply, sizeof(reply));
         return;
     }
-
     if (command != USBIP_CMD_SUBMIT) {
-        printf("[test] unexpected command 0x%08X\n", command);
-        return;
-    }
-
-    // Log every incoming submit
-    if (ep == 0) {
-        printf("\n>>> CTRL %s seq=%-4u ep=0\n",
-               direction == USBIP_DIR_IN ? "IN " : "OUT", seqnum);
-        logSetup(cmd.setup);
-    } else {
-        printf("\n>>> ep=%u %s seq=%-4u len=%u\n",
-               ep, direction == USBIP_DIR_IN ? "IN " : "OUT",
-               seqnum, ntohl(cmd.transfer_buffer_length));
+        printf("[test] unexpected command 0x%08X\n", command); return;
     }
 
     if (ep == 0) {
-        if (direction == USBIP_DIR_IN)
-            handleControlIn(sock_fd, seqnum, cmd.setup);
-        else
-            handleControlOut(sock_fd, seqnum, cmd.setup);
+        if (direction == USBIP_DIR_IN) handleControlIn(fd, seqnum, cmd.setup);
+        else                           handleControlOut(fd, seqnum, cmd.setup);
     } else if (ep == 1 && direction == USBIP_DIR_IN) {
-        handleInterruptIn(sock_fd, seqnum);
+        handleInterruptIn(fd, seqnum);
     } else {
-        printf(">>> ep=%u dir=%u seq=%u → STALL (unhandled)\n", ep, direction, seqnum);
-        sendRetSubmit(sock_fd, seqnum, -32, nullptr, 0);
+        sendRetSubmit(fd, seqnum, -32, nullptr, 0);
     }
 }
 
-// ── main ───────────────────────────────────────────────────────────────────
+// ── main ──────────────────────────────────────────────────────────────────────
 
-int main() {
+int main(int argc, char* argv[])
+{
+    // Optional args: device_id (0x00-0x04)  reply_port (default 7789)
+    // Usage:  wasd_mouse_test [device_id] [reply_port]
+    //   e.g.: wasd_mouse_test 0 7789
+    //         wasd_mouse_test 1 7790   (second virtual device)
+    uint16_t device_udp_port = DEVICE_BASE_PORT;
+    if (argc >= 2) {
+        MY_DEVICE_ID     = static_cast<uint8_t>(strtoul(argv[1], nullptr, 0));
+        device_udp_port  = static_cast<uint16_t>(DEVICE_BASE_PORT + MY_DEVICE_ID);
+    }
+    if (argc >= 3) {
+        device_udp_port = static_cast<uint16_t>(strtoul(argv[2], nullptr, 0));
+    }
+    printf("[test] device_id=0x%02X  reply_port=%u\n", MY_DEVICE_ID, device_udp_port);
     struct sigaction sa{};
     sa.sa_handler = onSignal;
     sigaction(SIGINT,  &sa, nullptr);
     sigaction(SIGTERM, &sa, nullptr);
 
-    // ── Connect to daemon ─────────────────────────────────────────────────
-    int sock = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (sock < 0) { perror("[test] socket"); return 1; }
+    // ── Create device UDP socket ──────────────────────────────────────────
+    g_udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (g_udp_fd < 0) { perror("[test] socket"); return 1; }
 
-    sockaddr_un addr{};
-    addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, "/tmp/wirelesshub.sock", sizeof(addr.sun_path) - 1);
-
-    if (connect(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
-        perror("[test] connect (is the daemon running?)");
-        return 1;
+    sockaddr_in my_addr = makeAddr(nullptr, device_udp_port);
+    if (bind(g_udp_fd, reinterpret_cast<sockaddr*>(&my_addr), sizeof(my_addr)) < 0) {
+        perror("[test] bind"); return 1;
     }
-    printf("[test] connected to daemon - vhci attach will follow shortly\n");
+    printf("[test] bound device UDP socket on port %u\n", device_udp_port);
 
-    // ── Raw terminal (non-canonical, no echo) ─────────────────────────────
+    // Daemon address
+    g_daemon_addr = makeAddr("127.0.0.1", DAEMON_PORT);
+
+    // ── Send DEVICE_EVENT CONNECT ─────────────────────────────────────────
+    DeviceEventPayload dep{};
+    dep.device_id  = MY_DEVICE_ID;
+    dep.event      = static_cast<uint8_t>(DeviceEvent::CONNECT);
+    dep.speed      = static_cast<uint8_t>(UsbSpeed::FULL);
+    dep.usb_class  = 0x03; // HID
+    dep.subclass   = 0x01; // Boot
+    dep.protocol   = 0x02; // Mouse
+    dep.reply_port = device_udp_port;
+
+    Header hdr{};
+    hdr.cmd_type    = static_cast<uint8_t>(CmdType::DEVICE_EVENT);
+    hdr.device_id   = MY_DEVICE_ID;
+    hdr.seq         = g_udp_seq++;
+    hdr.payload_len = sizeof(dep);
+
+    uint8_t connect_pkt[sizeof(hdr) + sizeof(dep)];
+    memcpy(connect_pkt,               &hdr, sizeof(hdr));
+    memcpy(connect_pkt + sizeof(hdr), &dep, sizeof(dep));
+    sendto(g_udp_fd, connect_pkt, sizeof(connect_pkt), 0,
+           reinterpret_cast<const sockaddr*>(&g_daemon_addr), sizeof(g_daemon_addr));
+    printf("[test] sent DEVICE_EVENT CONNECT for device_id=0x%02X  reply_port=%u → daemon 127.0.0.1:%u\n",
+           MY_DEVICE_ID, device_udp_port, DAEMON_PORT);
+
+    // ── Raw terminal ──────────────────────────────────────────────────────
     tcgetattr(STDIN_FILENO, &g_old_termios);
     termios raw = g_old_termios;
-    raw.c_lflag &= ~static_cast<tcflag_t>(ICANON | ECHO);
+    raw.c_lflag &= ~tcflag_t(ICANON | ECHO);
     raw.c_cc[VMIN]  = 0;
     raw.c_cc[VTIME] = 0;
     tcsetattr(STDIN_FILENO, TCSANOW, &raw);
-
-    // Make stdin non-blocking
-    int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
-    fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
+    int fl = fcntl(STDIN_FILENO, F_GETFL, 0);
+    fcntl(STDIN_FILENO, F_SETFL, fl | O_NONBLOCK);
 
     printf("[test] WASD=move  Q=quit\n");
-    printf("[test] W=up  S=down  A=left  D=right\n");
 
-    // ── epoll: watch socket (kernel→us) + stdin (WASD) ───────────────────
+    // ── epoll: watch UDP socket + stdin ───────────────────────────────────
     int epfd = epoll_create1(0);
     if (epfd < 0) { perror("[test] epoll_create1"); return 1; }
 
-    auto addEpoll = [&](int fd, uint32_t events) {
-        epoll_event ev{};
-        ev.events  = events;
-        ev.data.fd = fd;
+    auto addEpoll = [&](int fd, uint32_t evts) {
+        epoll_event ev{}; ev.events = evts; ev.data.fd = fd;
         epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev);
     };
+    addEpoll(g_udp_fd, EPOLLIN);
+    addEpoll(STDIN_FILENO, EPOLLIN);
 
-    addEpoll(sock,          EPOLLIN | EPOLLRDHUP);
-    addEpoll(STDIN_FILENO,  EPOLLIN);
-
-    // Large buffer: kernel may queue 16+ Interrupt IN URBs at once (each 48 B)
-    uint8_t buf[65536];
+    uint8_t pkt_buf[65536 + sizeof(Header)];
     epoll_event events[4];
 
     while (g_running) {
         int n = epoll_wait(epfd, events, 4, 100);
         if (n < 0) {
             if (errno == EINTR) continue;
-            perror("[test] epoll_wait");
-            break;
+            perror("[test] epoll_wait"); break;
         }
 
         for (int i = 0; i < n; ++i) {
-            int fd = events[i].data.fd;
+            int fd    = events[i].data.fd;
+            uint32_t ev = events[i].events;
 
-            // ── Daemon/kernel disconnected ───────────────────────────────
-            if (fd == sock && (events[i].events & (EPOLLRDHUP | EPOLLERR | EPOLLHUP))) {
-                printf("[test] daemon disconnected\n");
-                g_running = false;
-                break;
-            }
+            // ── UDP packet from daemon ────────────────────────────────────
+            if (fd == g_udp_fd && (ev & EPOLLIN)) {
+                sockaddr_in sender{};
+                socklen_t   slen = sizeof(sender);
+                ssize_t len = recvfrom(g_udp_fd, pkt_buf, sizeof(pkt_buf), 0,
+                                       reinterpret_cast<sockaddr*>(&sender), &slen);
+                if (len < static_cast<ssize_t>(sizeof(Header))) continue;
 
-            // ── USB/IP from kernel ────────────────────────────────────────
-            if (fd == sock && (events[i].events & EPOLLIN)) {
-                ssize_t len = read(sock, buf, sizeof(buf));
-                if (len <= 0) { g_running = false; break; }
+                Header rhdr;
+                memcpy(&rhdr, pkt_buf, sizeof(rhdr));
+                const uint8_t* payload = pkt_buf + sizeof(rhdr);
+                size_t pay_len = static_cast<size_t>(len) - sizeof(rhdr);
 
-                // Loop: one read() may contain multiple back-to-back CMD_SUBMITs.
-                // Each packet = 48-byte header + optional OUT payload.
+                if (static_cast<CmdType>(rhdr.cmd_type) != CmdType::RAW_DATA) {
+                    printf("[test] unexpected cmd=0x%02X, ignoring\n", rhdr.cmd_type);
+                    continue;
+                }
+                if (rhdr.device_id != MY_DEVICE_ID) {
+                    printf("[test] wrong device_id=0x%02X, ignoring\n", rhdr.device_id);
+                    continue;
+                }
+
+                // Process multi-packet USB/IP stream (multiple CMD_SUBMITs in payload)
                 size_t offset = 0;
-                size_t total  = static_cast<size_t>(len);
-                while (offset + sizeof(UsbipCmdSubmit) <= total) {
-                    UsbipCmdSubmit hdr;
-                    memcpy(&hdr, buf + offset, sizeof(hdr));
-                    uint32_t dir   = ntohl(hdr.basic.direction);
+                while (offset + sizeof(UsbipCmdSubmit) <= pay_len) {
+                    UsbipCmdSubmit usbip_hdr;
+                    memcpy(&usbip_hdr, payload + offset, sizeof(usbip_hdr));
+                    uint32_t dir   = ntohl(usbip_hdr.basic.direction);
                     uint32_t extra = (dir == USBIP_DIR_OUT)
-                                     ? ntohl(hdr.transfer_buffer_length) : 0;
-                    size_t pkt = sizeof(UsbipCmdSubmit) + extra;
-                    if (offset + pkt > total) {
-                        printf("[test] incomplete packet at offset %zu, stopping\n", offset);
+                                     ? ntohl(usbip_hdr.transfer_buffer_length) : 0;
+                    size_t pkt_sz = sizeof(UsbipCmdSubmit) + extra;
+                    if (offset + pkt_sz > pay_len) {
+                        printf("[test] incomplete usbip pkt at offset %zu\n", offset);
                         break;
                     }
-                    dispatchUsbip(sock, buf + offset, pkt);
-                    offset += pkt;
+                    dispatchUsbip(fd, payload + offset, pkt_sz);
+                    offset += pkt_sz;
                 }
             }
 
-            // ── Keyboard (WASD) ───────────────────────────────────────────
-            if (fd == STDIN_FILENO && (events[i].events & EPOLLIN)) {
+            // ── WASD keyboard ─────────────────────────────────────────────
+            if (fd == STDIN_FILENO && (ev & EPOLLIN)) {
                 char ch = 0;
                 if (read(STDIN_FILENO, &ch, 1) == 1) {
                     constexpr int8_t STEP = 8;
                     switch (ch) {
-                    case 'w': case 'W':
-                        g_dy -= STEP;
-                        printf("[KEY] W  →  dy=%d (queued, sends on next INT IN poll)\n", (int)g_dy);
-                        fflush(stdout);
-                        break;
-                    case 's': case 'S':
-                        g_dy += STEP;
-                        printf("[KEY] S  →  dy=%d\n", (int)g_dy);
-                        fflush(stdout);
-                        break;
-                    case 'a': case 'A':
-                        g_dx -= STEP;
-                        printf("[KEY] A  →  dx=%d\n", (int)g_dx);
-                        fflush(stdout);
-                        break;
-                    case 'd': case 'D':
-                        g_dx += STEP;
-                        printf("[KEY] D  →  dx=%d\n", (int)g_dx);
-                        fflush(stdout);
-                        break;
-                    case 'q': case 'Q': case 3 /* Ctrl+C */:
-                        g_running = false;
-                        break;
-                    default:
-                        printf("[KEY] unknown key 0x%02X\n", (unsigned char)ch);
-                        fflush(stdout);
-                        break;
+                    case 'w': case 'W': g_dy -= STEP;
+                        printf("[KEY] W→dy=%d\n", int(g_dy)); fflush(stdout); break;
+                    case 's': case 'S': g_dy += STEP;
+                        printf("[KEY] S→dy=%d\n", int(g_dy)); fflush(stdout); break;
+                    case 'a': case 'A': g_dx -= STEP;
+                        printf("[KEY] A→dx=%d\n", int(g_dx)); fflush(stdout); break;
+                    case 'd': case 'D': g_dx += STEP;
+                        printf("[KEY] D→dx=%d\n", int(g_dx)); fflush(stdout); break;
+                    case 'q': case 'Q': case 3: g_running = false; break;
+                    default: printf("[KEY] 0x%02X\n", (unsigned char)ch); break;
                     }
                 }
             }
@@ -577,8 +427,19 @@ int main() {
     }
 
     restoreTerminal();
-    close(sock);
+
+    // ── Send DEVICE_EVENT DISCONNECT before exiting ───────────────────────
+    dep.event = static_cast<uint8_t>(DeviceEvent::DISCONNECT);
+    hdr.seq   = g_udp_seq++;
+    memcpy(connect_pkt,               &hdr, sizeof(hdr));
+    memcpy(connect_pkt + sizeof(hdr), &dep, sizeof(dep));
+    sendto(g_udp_fd, connect_pkt, sizeof(connect_pkt), 0,
+           reinterpret_cast<const sockaddr*>(&g_daemon_addr), sizeof(g_daemon_addr));
+    printf("[test] sent DEVICE_EVENT DISCONNECT\n");
+
+    close(g_udp_fd);
     close(epfd);
     printf("[test] done\n");
     return 0;
 }
+

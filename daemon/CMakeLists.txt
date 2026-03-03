@@ -17,5 +17,7 @@ target_link_libraries(wirelesshubd PRIVATE pthread)
 install(TARGETS wirelesshubd DESTINATION /usr/local/bin)
 
 # ── WASD HID mouse test (fake ESP32) ──────────────────────────────────────
-add_executable(wasd_mouse_test tests/WasdMouseTest.cpp)
+add_executable(wasd_mouse_test
+    tests/WasdMouseTest.cpp)
 target_compile_options(wasd_mouse_test PRIVATE -O2 -Wall -Wextra)
+target_include_directories(wasd_mouse_test PRIVATE src)

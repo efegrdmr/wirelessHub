@@ -15,7 +15,8 @@ VhciDriver::~VhciDriver() {
 bool VhciDriver::init() {
     // load vhci-hcd kernel module if not already present
     if (system("modprobe vhci-hcd") != 0) {
-        printf("[VhciDriver] warning: modprobe vhci-hcd failed (may already be loaded)\n");
+        printf("[VhciDriver] warning: modprobe vhci-hcd failed");
+        return false;
     }
 
     vhci_fd_ = open(VHCI_DEV, O_RDWR | O_NONBLOCK);
