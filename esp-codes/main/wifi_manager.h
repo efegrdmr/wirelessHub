@@ -14,7 +14,7 @@
 // ── Config ────────────────────────────────────────────────────────────────────
 #define WIFI_MAX_RETRY      5                    // STA fail → AP fallback after this
 #define WIFI_AP_SSID        "WirelessHub-Setup"  // captive portal network name
-#define WIFI_AP_MAX_CONN    4                    // concurrent AP clients
+#define WIFI_AP_MAX_CONN    1                    // concurrent AP clients
 #define WIFI_NVS_NAMESPACE  "wifi_creds"
 #define WIFI_NVS_KEY_SSID   "ssid"
 #define WIFI_NVS_KEY_PASS   "pass"

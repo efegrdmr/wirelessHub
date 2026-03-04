@@ -208,7 +208,7 @@ static void url_decode(char *dst, const char *src, size_t dst_len)
 }
 
 // Extracts a field from an application/x-www-form-urlencoded body.
-// "ssid=MyNet&pass=abc" with key="ssid" → writes "MyNet" into out.
+// "ssid=MyNet&pass=abc" with key="ssid" -> writes "MyNet" into out.
 static bool form_field(const char *body, const char *key,
                         char *out, size_t out_len)
 {
