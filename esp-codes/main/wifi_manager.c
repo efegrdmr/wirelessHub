@@ -40,6 +40,10 @@ static bool               s_netif_ap_created  = false;
 static TaskHandle_t       s_dns_task     = NULL;
 static int                s_dns_sock     = -1;
 
+// WiFi scan results
+static char s_scan_ssids[20][33];
+static int  s_scan_count = 0;
+
 
 // ── NVS ───────────────────────────────────────────────────────────────────────
 static bool nvs_load_credentials(char *ssid, size_t ssid_len,
@@ -143,6 +147,31 @@ static void dns_server_task(void *arg)
     vTaskDelete(NULL);
 }
 
+// ── WiFi scan ───────────────────────────────────────────────────────────────
+// Runs BEFORE event handler registration so no connect attempt is triggered.
+static void wifi_scan(void)
+{
+    if (!s_netif_sta_created) {
+        esp_netif_create_default_wifi_sta();
+        s_netif_sta_created = true;
+    }
+    esp_wifi_set_mode(WIFI_MODE_STA);
+    esp_wifi_start();
+
+    if (esp_wifi_scan_start(NULL, true) == ESP_OK) {
+        uint16_t count = 20;
+        wifi_ap_record_t records[20];
+        esp_wifi_scan_get_ap_records(&count, records);
+        s_scan_count = (int)count;
+        for (int i = 0; i < s_scan_count; i++) {
+            strncpy(s_scan_ssids[i], (char *)records[i].ssid, 32);
+            s_scan_ssids[i][32] = '\0';
+        }
+        ESP_LOGI(TAG, "Scan: found %d networks", s_scan_count);
+    }
+    esp_wifi_stop();
+}
+
 static void start_dns_server(void)
 {
     if (s_dns_task) return;
@@ -197,19 +226,22 @@ static bool form_field(const char *body, const char *key,
     return true;
 }
 
-// ── HTTP handlers ─────────────────────────────────────────────────────────────
-static const char *ROOT_HTML =
-    "<!DOCTYPE html><html><head><meta charset='utf-8'>"
-    "<title>WirelessHub Setup</title></head><body>"
-    "<h2>WirelessHub WiFi Setup</h2>"
-    "<form method='POST' action='/save'>"
-    "Network (SSID):<br>"
-    "<input name='ssid' type='text' maxlength='31' required><br><br>"
-    "Password:<br>"
-    "<input name='pass' type='password' maxlength='63'><br><br>"
-    "<input type='submit' value='Connect'>"
-    "</form></body></html>";
+// HTML-escape src into dst (dst_len includes null terminator)
+static void html_escape(char *dst, const char *src, size_t dst_len)
+{
+    size_t o = 0;
+    while (*src && o < dst_len - 7) {
+        if      (*src == '&') { memcpy(dst+o, "&amp;",  5); o += 5; }
+        else if (*src == '"') { memcpy(dst+o, "&quot;", 6); o += 6; }
+        else if (*src == '<') { memcpy(dst+o, "&lt;",   4); o += 4; }
+        else if (*src == '>') { memcpy(dst+o, "&gt;",   4); o += 4; }
+        else                  { dst[o++] = *src; }
+        src++;
+    }
+    dst[o] = '\0';
+}
 
+// ── HTTP handlers ─────────────────────────────────────────────────────────────
 static esp_err_t send_portal_html(httpd_req_t *req)
 {
     httpd_resp_set_status(req, "200 OK");
@@ -217,7 +249,72 @@ static esp_err_t send_portal_html(httpd_req_t *req)
     httpd_resp_set_hdr(req, "Cache-Control", "no-store, no-cache, must-revalidate");
     httpd_resp_set_hdr(req, "Pragma", "no-cache");
     httpd_resp_set_hdr(req, "Connection", "close");
-    httpd_resp_send(req, ROOT_HTML, HTTPD_RESP_USE_STRLEN);
+
+    static const char HEAD[] =
+        "<!DOCTYPE html><html><head>"
+        "<meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        "<title>WirelessHub Setup</title>"
+        "<style>"
+        "*{box-sizing:border-box;margin:0;padding:0}"
+        "body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;"
+        "background:#f0f2f5;display:flex;align-items:center;justify-content:center;"
+        "min-height:100vh;padding:16px}"
+        ".card{background:#fff;border-radius:16px;padding:32px 24px;width:100%;"
+        "max-width:400px;box-shadow:0 4px 24px rgba(0,0,0,.08)}"
+        "h2{font-size:1.25rem;font-weight:700;color:#111;margin-bottom:4px}"
+        "p{font-size:.85rem;color:#888;margin-bottom:24px}"
+        "label{display:block;font-size:.78rem;font-weight:600;color:#555;"
+        "margin-bottom:6px;margin-top:18px}"
+        "select,input{width:100%;padding:12px 14px;border:1.5px solid #e0e0e0;"
+        "border-radius:10px;font-size:1rem;outline:none;background:#fafafa;"
+        "-webkit-appearance:none;appearance:none;color:#111}"
+        "select{background-image:url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' "
+        "width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1l5 5 5-5' stroke='%23888' "
+        "stroke-width='1.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E\");"
+        "background-repeat:no-repeat;background-position:right 14px center;padding-right:36px}"
+        "select:focus,input:focus{border-color:#4f8ef7;background:#fff}"
+        ".sep{text-align:center;color:#bbb;font-size:.78rem;margin-top:14px;margin-bottom:2px}"
+        "button{margin-top:28px;width:100%;padding:14px;background:#4f8ef7;"
+        "color:#fff;border:none;border-radius:10px;font-size:1rem;font-weight:600;cursor:pointer}"
+        "button:active{background:#3a7de0}"
+        "</style></head><body><div class='card'>"
+        "<h2>WirelessHub Setup</h2>"
+        "<p>Connect the device to your WiFi network.</p>"
+        "<form method='POST' action='/save'>";
+
+    static const char SEL_OPEN[] =
+        "<label>Network</label>"
+        "<select name='ssid_list'>"
+        "<option value=''>— choose network —</option>";
+
+    static const char SEL_CLOSE[] = "</select>";
+
+    static const char TAIL[] =
+        "<p class='sep'>or type manually</p>"
+        "<input name='ssid_manual' placeholder='SSID' maxlength='31'>"
+        "<label>Password</label>"
+        "<input name='pass' type='password' placeholder='Leave empty if open' maxlength='63'>"
+        "<button type='submit'>Connect</button>"
+        "</form></div></body></html>";
+
+    httpd_resp_send_chunk(req, HEAD, HTTPD_RESP_USE_STRLEN);
+
+    if (s_scan_count > 0) {
+        httpd_resp_send_chunk(req, SEL_OPEN, HTTPD_RESP_USE_STRLEN);
+        char opt[320];
+        for (int i = 0; i < s_scan_count; i++) {
+            if (!s_scan_ssids[i][0]) continue;
+            char esc[140] = {0};
+            html_escape(esc, s_scan_ssids[i], sizeof(esc));
+            snprintf(opt, sizeof(opt), "<option value=\"%s\">%s</option>", esc, esc);
+            httpd_resp_send_chunk(req, opt, HTTPD_RESP_USE_STRLEN);
+        }
+        httpd_resp_send_chunk(req, SEL_CLOSE, HTTPD_RESP_USE_STRLEN);
+    }
+
+    httpd_resp_send_chunk(req, TAIL, HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(req, NULL, 0);
     return ESP_OK;
 }
 
@@ -283,7 +380,11 @@ static esp_err_t post_save_handler(httpd_req_t *req)
     char ssid[32] = {0};
     char pass[64] = {0};
 
-    if (!form_field(body, "ssid", ssid, sizeof(ssid)) || ssid[0] == '\0') {
+    // ssid_manual takes priority; fall back to ssid_list (select)
+    if (!form_field(body, "ssid_manual", ssid, sizeof(ssid)) || ssid[0] == '\0')
+        form_field(body, "ssid_list", ssid, sizeof(ssid));
+
+    if (ssid[0] == '\0') {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing SSID");
         return ESP_FAIL;
     }
@@ -491,13 +592,18 @@ static void wifi_manager_task(void *arg)
     init_cfg.ampdu_rx_enable = 0;  // Android AMPDU RX bug workaround
     ESP_ERROR_CHECK(esp_wifi_init(&init_cfg));
 
+    char ssid[32] = {0}, pass[64] = {0};
+    bool has_creds = nvs_load_credentials(ssid, sizeof(ssid), pass, sizeof(pass));
+
+    // Scan before registering event handlers — no connect attempt triggered
+    if (!has_creds) wifi_scan();
+
     ESP_ERROR_CHECK(esp_event_handler_instance_register(
         WIFI_EVENT, ESP_EVENT_ANY_ID,   wifi_event_handler, NULL, NULL));
     ESP_ERROR_CHECK(esp_event_handler_instance_register(
         IP_EVENT,   IP_EVENT_STA_GOT_IP, wifi_event_handler, NULL, NULL));
 
-    char ssid[32] = {0}, pass[64] = {0};
-    if (nvs_load_credentials(ssid, sizeof(ssid), pass, sizeof(pass)))
+    if (has_creds)
         start_sta_mode(ssid, pass);
     else
         start_ap_mode();
@@ -509,7 +615,7 @@ static void wifi_manager_task(void *arg)
 void wifi_manager_start(void)
 {
     s_event_group = xEventGroupCreate();
-    xTaskCreate(wifi_manager_task, "wifi_mgr", 4096, NULL, 5, NULL);
+    xTaskCreate(wifi_manager_task, "wifi_mgr", 6144, NULL, 5, NULL);
 }
 
 EventGroupHandle_t wifi_manager_event_group(void)
