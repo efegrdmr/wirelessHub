@@ -8,6 +8,7 @@
 static constexpr uint16_t DAEMON_PORT      = 7788;   // daemon listens here
 static constexpr uint16_t DEVICE_BASE_PORT = 7789;   // device_id N uses port 7789+N
 static constexpr size_t   MAX_PACKET       = 65536 + 6; // 6 = sizeof(Header)
+static constexpr size_t   MTU_PAYLOAD      = 1400;       // max payload per UDP datagram
 
 // Build a sockaddr_in from a dotted-decimal IP string and port.
 // Pass nullptr or "" for INADDR_ANY.
@@ -35,10 +36,23 @@ struct Header
 
 static_assert(sizeof(Header) == 6, "Header must be 6 bytes");
 
+// Payload for CmdType::DISCOVER_REPLY
+// Daemon sends this unicast to the device that issued a DISCOVER broadcast.
+// Device learns daemon IP from UDP sender address; port is here for completeness.
+struct DiscoverReplyPayload
+{
+    uint16_t daemon_port;  // DAEMON_PORT, little-endian
+} __attribute__((packed));
+
+static_assert(sizeof(DiscoverReplyPayload) == 2, "DiscoverReplyPayload must be 2 bytes");
+
 enum class CmdType : uint8_t {
+    DISCOVER         = 0x01,  // device → daemon: broadcast discovery request (no payload)
+    DISCOVER_REPLY   = 0x02,  // daemon → device: unicast reply
     DEVICE_EVENT     = 0x10,  // device connected/disconnected
     OPTIMIZED_DATA   = 0x20,
-    RAW_DATA         = 0x30,
+    RAW_DATA         = 0x30,  // single-datagram USB/IP pass-through
+    RAW_FRAG         = 0x31,  // fragmented USB/IP pass-through (payload > MTU_PAYLOAD)
     ACK              = 0x40,
     ERROR            = 0xFF
 };
@@ -76,3 +90,14 @@ struct DeviceEventPayload
 } __attribute__((packed));
 
 static_assert(sizeof(DeviceEventPayload) == 8, "DeviceEventPayload must be 8 bytes");
+
+// Follows the 6-byte Header when cmd_type == RAW_FRAG.
+// Allows reassembly of USB/IP transfers larger than MTU_PAYLOAD.
+struct FragHeader
+{
+    uint16_t transfer_seq; // per-device rolling counter identifying the transfer
+    uint8_t  frag_idx;     // 0-based index of this fragment
+    uint8_t  frag_total;   // total number of fragments for this transfer
+} __attribute__((packed));
+
+static_assert(sizeof(FragHeader) == 4, "FragHeader must be 4 bytes");

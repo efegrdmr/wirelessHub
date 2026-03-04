@@ -1,0 +1,10 @@
+# Reduce mbedTLS per-session SSL record buffers from 16KB to 4KB.
+# For a captive portal serving small HTML + JSON responses this is plenty.
+# Default 16384 * 2 = 32KB per TLS session → causes MBEDTLS_ERR_SSL_ALLOC_FAILED
+# on ESP32-S3 alongside WiFi + HTTP + DNS heap usage.
+CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=4096
+CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=4096
+
+# Allocate mbedTLS buffers dynamically (only when a session is active)
+# instead of statically at startup — saves heap when no client is connected.
+CONFIG_MBEDTLS_DYNAMIC_BUFFER=y

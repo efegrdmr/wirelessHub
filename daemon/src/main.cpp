@@ -87,7 +87,7 @@ int main()
     epoll_event events[MAX_EVENTS];
 
     while (g_running) {
-        int nfds = epoll_wait(epfd, events, MAX_EVENTS, 500);
+        int nfds = ::epoll_wait(epfd, events, MAX_EVENTS, 500);
         if (nfds < 0) {
             if (errno == EINTR) continue;
             perror("[main] epoll_wait"); break;

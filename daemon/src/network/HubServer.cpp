@@ -70,6 +70,45 @@ void HubServer::onUdpReadable()
         return;
     }
 
+    // ── RAW_FRAG ─────────────────────────────────────────────────────────
+    if (cmd == CmdType::RAW_FRAG) {
+        if (pay_len < sizeof(FragHeader)) {
+            printf("[HubServer] RAW_FRAG too short (%zu B), dropping\n", pay_len);
+            return;
+        }
+        auto it = sessions_.find(hdr.device_id);
+        if (it == sessions_.end()) {
+            printf("[HubServer] RAW_FRAG for unknown device_id=0x%02X, dropping\n",
+                   hdr.device_id);
+            return;
+        }
+        FragHeader fhdr;
+        memcpy(&fhdr, payload, sizeof(fhdr));
+        const uint8_t* chunk     = payload   + sizeof(fhdr);
+        size_t         chunk_len = pay_len   - sizeof(fhdr);
+        it->second->handler->onDeviceFragData(
+            fhdr.transfer_seq, fhdr.frag_idx, fhdr.frag_total, chunk, chunk_len);
+        return;
+    }
+
+    // ── DISCOVER ───────────────────────────────────────────────────
+    if (cmd == CmdType::DISCOVER) {
+        DiscoverReplyPayload resp = { static_cast<uint16_t>(DAEMON_PORT) };
+        Header respHeader{
+            .cmd_type = static_cast<uint8_t>(CmdType::DISCOVER_REPLY),
+            .payload_len = sizeof(resp)
+        };
+
+        uint8_t buf[sizeof(respHeader) + sizeof(resp)];
+        memcpy(buf, &respHeader, sizeof(respHeader));
+        memcpy(buf + sizeof(respHeader), &resp, sizeof(resp));
+
+        sock_.sendTo(sender, buf, sizeof(buf));
+        printf("[HubServer] DISCOVER from %s — replied\n",
+        UdpSocket::addrToStr(sender).c_str());
+        return;
+    }
+
     printf("[HubServer] unhandled cmd=0x%02X\n", hdr.cmd_type);
 }
 
