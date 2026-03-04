@@ -41,25 +41,12 @@ static TaskHandle_t       s_dns_task     = NULL;
 static int                s_dns_sock     = -1;
 
 
-// ── NVS helpers ───────────────────────────────────────────────────────────────
-static bool nvs_has_credentials(void)
-{
-    nvs_handle_t h;
-    if (nvs_open(WIFI_NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK)
-        return false;
-    char buf[2];
-    size_t len = sizeof(buf);
-    bool ok = (nvs_get_str(h, WIFI_NVS_KEY_SSID, buf, &len) == ESP_OK);
-    nvs_close(h);
-    return ok;
-}
-
+// ── NVS ───────────────────────────────────────────────────────────────────────
 static bool nvs_load_credentials(char *ssid, size_t ssid_len,
                                   char *pass, size_t pass_len)
 {
     nvs_handle_t h;
-    if (nvs_open(WIFI_NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK)
-        return false;
+    if (nvs_open(WIFI_NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) return false;
     bool ok = (nvs_get_str(h, WIFI_NVS_KEY_SSID, ssid, &ssid_len) == ESP_OK) &&
               (nvs_get_str(h, WIFI_NVS_KEY_PASS,  pass, &pass_len) == ESP_OK);
     nvs_close(h);
@@ -74,95 +61,80 @@ static void nvs_save_credentials(const char *ssid, const char *pass)
     ESP_ERROR_CHECK(nvs_set_str(h, WIFI_NVS_KEY_PASS, pass));
     ESP_ERROR_CHECK(nvs_commit(h));
     nvs_close(h);
-    ESP_LOGI(TAG, "Credentials saved: SSID=%s", ssid);
 }
 
-// ── DNS hijack server ────────────────────────────────────────────────────────
-// Responds to every DNS A-query with 192.168.4.1 so that any domain the
-// connecting device tries to look up points to our captive portal.
+// ── DNS hijack ────────────────────────────────────────────────────────────────
+// Replies to every DNS query with AP_IP_STR so all domains point to the portal.
 static void dns_server_task(void *arg)
 {
-    s_dns_sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (s_dns_sock < 0) {
-        ESP_LOGE(TAG, "DNS socket create failed");
-        vTaskDelete(NULL);
-        return;
-    }
-
-    struct sockaddr_in bind_addr = {
+    struct sockaddr_in addr = {
         .sin_family      = AF_INET,
         .sin_port        = htons(53),
         .sin_addr.s_addr = INADDR_ANY,
     };
-    if (bind(s_dns_sock, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) < 0) {
-        ESP_LOGE(TAG, "DNS bind failed");
-        close(s_dns_sock); s_dns_sock = -1;
+    s_dns_sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (s_dns_sock < 0 || bind(s_dns_sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        ESP_LOGE(TAG, "DNS socket error");
+        if (s_dns_sock >= 0) { close(s_dns_sock); s_dns_sock = -1; }
         vTaskDelete(NULL);
         return;
     }
-    ESP_LOGI(TAG, "DNS hijack server running on port 53");
+    ESP_LOGI(TAG, "DNS running on :53");
 
     uint32_t ap_ip = inet_addr(AP_IP_STR);
+    static uint8_t buf[512], resp[512];
 
-    static uint8_t buf[512];
     while (1) {
         struct sockaddr_in client;
         socklen_t clen = sizeof(client);
         int len = recvfrom(s_dns_sock, buf, sizeof(buf) - 1, 0,
                            (struct sockaddr *)&client, &clen);
-        if (len < 12) break; // socket closed or error
+        if (len < 12) break;
 
-        // Log the queried hostname (labels in DNS wire format)
+        // Extract queried hostname for logging
         char qname[128] = {0};
         int qi = 12, qo = 0;
-        while (qi < len && buf[qi] != 0 && qo < (int)sizeof(qname) - 2) {
-            uint8_t label_len = buf[qi++];
-            if ((label_len & 0xC0) == 0xC0) break; // pointer, stop
-            for (int k = 0; k < label_len && qi < len && qo < (int)sizeof(qname) - 2; k++)
-                qname[qo++] = (char)buf[qi++];
+        while (qi < len && buf[qi] && qo < (int)sizeof(qname) - 2) {
+            uint8_t l = buf[qi++];
+            if ((l & 0xC0) == 0xC0) break;
+            for (int k = 0; k < l && qi < len; k++) qname[qo++] = buf[qi++];
             qname[qo++] = '.';
         }
-        if (qo > 0) qname[qo - 1] = '\0'; // remove trailing dot
-        ESP_LOGI(TAG, "DNS query from %s: %s -> " AP_IP_STR,
-                 inet_ntoa(client.sin_addr), qname);
+        if (qo) qname[qo - 1] = '\0';
+        ESP_LOGI(TAG, "DNS %s -> " AP_IP_STR, qname);
 
-        // Find end of question name (null-terminated labels)
-        int name_end = 12;
-        while (name_end < len && buf[name_end] != 0) {
-            if ((buf[name_end] & 0xC0) == 0xC0) { name_end += 2; break; }
-            name_end += buf[name_end] + 1;
+        // Find end of question section
+        int ne = 12;
+        while (ne < len && buf[ne]) {
+            if ((buf[ne] & 0xC0) == 0xC0) { ne += 2; goto found; }
+            ne += buf[ne] + 1;
         }
-        if (buf[name_end] == 0) name_end++; // consume null terminator
-        int qsection_end = name_end + 4;    // QTYPE(2) + QCLASS(2)
-        if (qsection_end > len) continue;
-
-        // Build response: header + question (copy) + answer (A record)
-        static uint8_t resp[512];
-        int q_len = qsection_end - 12;
+        ne++;  // consume null terminator
+        found:;
+        int qend = ne + 4;  // QTYPE(2) + QCLASS(2)
+        if (qend > len) continue;
+        int qlen = qend - 12;
 
         // Header
-        resp[0] = buf[0]; resp[1] = buf[1];  // transaction ID
-        resp[2] = 0x81;   resp[3] = 0x80;    // flags: response, no error
-        resp[4] = 0x00;   resp[5] = 0x01;    // QDCOUNT=1
-        resp[6] = 0x00;   resp[7] = 0x01;    // ANCOUNT=1
-        resp[8] = 0x00;   resp[9] = 0x00;    // NSCOUNT=0
-        resp[10] = 0x00;  resp[11] = 0x00;   // ARCOUNT=0
+        resp[0]=buf[0]; resp[1]=buf[1];            // txid
+        resp[2]=0x81;   resp[3]=0x80;              // QR=1, RCODE=0
+        resp[4]=0;      resp[5]=1;                 // QDCOUNT=1
+        resp[6]=0;      resp[7]=1;                 // ANCOUNT=1
+        resp[8]=0;      resp[9]=0;                 // NSCOUNT=0
+        resp[10]=0;     resp[11]=0;                // ARCOUNT=0
+        memcpy(resp + 12, buf + 12, qlen);
+        int pos = 12 + qlen;
 
-        // Question (copy)
-        memcpy(resp + 12, buf + 12, q_len);
-        int pos = 12 + q_len;
-
-        // Answer: name ptr → offset 12, A record, TTL=3, IP
-        resp[pos++] = 0xC0; resp[pos++] = 0x0C; // name pointer
-        resp[pos++] = 0x00; resp[pos++] = 0x01; // Type A
-        resp[pos++] = 0x00; resp[pos++] = 0x01; // Class IN
-        resp[pos++] = 0x00; resp[pos++] = 0x00; // TTL high
-        resp[pos++] = 0x00; resp[pos++] = 0x03; // TTL low = 3 s
-        resp[pos++] = 0x00; resp[pos++] = 0x04; // RDLENGTH = 4
+        // Answer: A record, TTL=3, RDLENGTH=4
+        resp[pos++]=0xC0; resp[pos++]=0x0C;        // name ptr → offset 12
+        resp[pos++]=0x00; resp[pos++]=0x01;        // Type A
+        resp[pos++]=0x00; resp[pos++]=0x01;        // Class IN
+        resp[pos++]=0x00; resp[pos++]=0x00;
+        resp[pos++]=0x00; resp[pos++]=0x03;        // TTL = 3 s
+        resp[pos++]=0x00; resp[pos++]=0x04;        // RDLENGTH = 4
         memcpy(resp + pos, &ap_ip, 4); pos += 4;
 
-        sendto(s_dns_sock, resp, pos, 0,
-               (struct sockaddr *)&client, clen);
+        sendto(s_dns_sock, resp, pos, 0, (struct sockaddr *)&client, clen);
     }
 
     close(s_dns_sock);
@@ -225,7 +197,7 @@ static bool form_field(const char *body, const char *key,
     return true;
 }
 
-// ── HTTP captive portal ───────────────────────────────────────────────────────
+// ── HTTP handlers ─────────────────────────────────────────────────────────────
 static const char *ROOT_HTML =
     "<!DOCTYPE html><html><head><meta charset='utf-8'>"
     "<title>WirelessHub Setup</title></head><body>"
@@ -238,9 +210,8 @@ static const char *ROOT_HTML =
     "<input type='submit' value='Connect'>"
     "</form></body></html>";
 
-static esp_err_t send_portal_html(httpd_req_t *req, const char *tag)
+static esp_err_t send_portal_html(httpd_req_t *req)
 {
-    ESP_LOGI(TAG, "%s %s -> 200 portal", tag, req->uri);
     httpd_resp_set_status(req, "200 OK");
     httpd_resp_set_type(req, "text/html");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store, no-cache, must-revalidate");
@@ -250,127 +221,64 @@ static esp_err_t send_portal_html(httpd_req_t *req, const char *tag)
     return ESP_OK;
 }
 
-// Catch-all: redirect any unrecognised URL to the setup page.
-// iOS, Android, and Windows use different URLs for captive portal detection;
-// this single handler catches them all via the 404 error hook.
+// 404 catch-all: return the portal page for any unrecognised URL
 static esp_err_t captive_redirect_handler(httpd_req_t *req, httpd_err_code_t err)
 {
     (void)err;
-    ESP_LOGW(TAG, "HTTP 404 fallback: %s", req->uri);
-    return send_portal_html(req, "HTTP [404]");
+    ESP_LOGW(TAG, "HTTP 404: %s -> portal", req->uri);
+    return send_portal_html(req);
 }
 
-// ── Platform-specific captive portal detection endpoints ─────────────────────
-// Android (AOSP): GET /generate_204  → expects HTTP 204 for "has internet"
-//                 anything else      → shows "Sign in to network" notification
-static esp_err_t android_generate_204_handler(httpd_req_t *req)
+// Probe endpoints that simply show the portal (Android, iOS, Linux NM)
+static esp_err_t portal_html_handler(httpd_req_t *req)
 {
-    return send_portal_html(req, "HTTP [Android]");
+    ESP_LOGI(TAG, "HTTP %s -> portal", req->uri);
+    return send_portal_html(req);
 }
 
-// Windows 11 captive portal workaround: redirect to http://logout.net
-// (NOT to portal — Win11 specifically checks for this redirect target)
-static esp_err_t windows_connecttest_handler(httpd_req_t *req)
+// Redirect to portal root (used for /ncsi.txt, /redirect, /canonical.html)
+static esp_err_t redirect_to_portal_handler(httpd_req_t *req)
 {
-    ESP_LOGI(TAG, "HTTP [Win11] %s -> redirect logout.net", req->uri);
-    httpd_resp_set_status(req, "302 Found");
-    httpd_resp_set_hdr(req, "Location", "http://logout.net");
-    httpd_resp_send(req, NULL, 0);
-    return ESP_OK;
-}
-
-// /wpad.dat: return 404 — stops Windows 10 calling it in a loop
-static esp_err_t wpad_404_handler(httpd_req_t *req)
-{
-    ESP_LOGI(TAG, "HTTP /wpad.dat -> 404");
-    httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "Not Found");
-    return ESP_OK;
-}
-
-// /favicon.ico: return 404 silently
-static esp_err_t favicon_404_handler(httpd_req_t *req)
-{
-    httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "Not Found");
-    return ESP_OK;
-}
-
-// /success.txt: 200 empty — Firefox captive portal call home
-static esp_err_t success_txt_handler(httpd_req_t *req)
-{
-    ESP_LOGI(TAG, "HTTP [Firefox] /success.txt -> 200");
-    httpd_resp_send(req, "", 0);
-    return ESP_OK;
-}
-
-// Generic redirect to portal URL (used for multiple probe paths)
-static esp_err_t portal_redirect_handler(httpd_req_t *req)
-{
-    ESP_LOGI(TAG, "HTTP probe %s -> redirect " AP_IP_URL, req->uri);
     httpd_resp_set_status(req, "302 Found");
     httpd_resp_set_hdr(req, "Location", AP_IP_URL);
     httpd_resp_send(req, NULL, 0);
     return ESP_OK;
 }
 
-// Linux NetworkManager: GET /check_network_status.txt or /nm-check.txt
-static esp_err_t linux_nmcheck_handler(httpd_req_t *req)
+// Windows 11: /connecttest.txt must redirect to http://logout.net specifically
+static esp_err_t windows_connecttest_handler(httpd_req_t *req)
 {
-    return send_portal_html(req, "HTTP [Linux]");
+    httpd_resp_set_status(req, "302 Found");
+    httpd_resp_set_hdr(req, "Location", "http://logout.net");
+    httpd_resp_send(req, NULL, 0);
+    return ESP_OK;
 }
 
-// iOS/macOS: GET /hotspot-detect.html
-static esp_err_t ios_hotspot_handler(httpd_req_t *req)
+// Return 404 silently (/wpad.dat, /favicon.ico) to stop repeated probing
+static esp_err_t not_found_handler(httpd_req_t *req)
 {
-    return send_portal_html(req, "HTTP [iOS]");
+    httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "Not Found");
+    return ESP_OK;
 }
 
-// ── RFC 8908 Captive Portal API endpoint ─────────────────────────────────────
-// DHCP Option 114 (RFC 8910) MUST point to this endpoint, not the user portal.
-// Modern clients (Android 11+, iOS 14+, Windows 10+) GET this URL and parse
-// the JSON. If "captive":true they show "Sign in to network" and open
-// "user-portal-url" in a sandboxed browser — no DNS/HTTPS probing needed.
+// RFC 8908 Captive Portal API — DHCP Option 114 points here
 static esp_err_t api_captive_handler(httpd_req_t *req)
 {
-    // RFC 8908 §5: always respond with application/captive+json.
-    // Some clients don't send Accept: application/captive+json, but still rely
-    // on DHCP option 114 to fetch this endpoint and decide captive state.
-    char accept_hdr[128] = {0};
-    if (httpd_req_get_hdr_value_str(req, "Accept", accept_hdr, sizeof(accept_hdr)) == ESP_OK) {
-        ESP_LOGI(TAG, "HTTP GET /api Accept=%s → JSON captive=true", accept_hdr);
-    } else {
-        ESP_LOGI(TAG, "HTTP GET /api (no Accept header) → JSON captive=true");
-    }
-
-    const char *json =
-        "{\n"
-        "  \"captive\": true,\n"
-        "  \"user-portal-url\": \"" AP_IP_URL "/\"\n"
-        "}";
-
+    const char *json = "{\"captive\":true,\"user-portal-url\":\"" AP_IP_URL "/\"}";
     httpd_resp_set_type(req, "application/captive+json");
     httpd_resp_set_hdr(req, "Cache-Control", "private, no-store");
     httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
 }
 
-static esp_err_t get_root_handler(httpd_req_t *req)
-{
-    ESP_LOGI(TAG, "HTTP GET / — serving setup page");
-    httpd_resp_set_type(req, "text/html");
-    httpd_resp_send(req, ROOT_HTML, HTTPD_RESP_USE_STRLEN);
-    return ESP_OK;
-}
-
 static esp_err_t post_save_handler(httpd_req_t *req)
 {
-    ESP_LOGI(TAG, "HTTP POST /save — credential submission");
     char body[512] = {0};
-    int  received  = httpd_req_recv(req, body, sizeof(body) - 1);
-    if (received <= 0) {
+    int n = httpd_req_recv(req, body, sizeof(body) - 1);
+    if (n <= 0) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Empty body");
         return ESP_FAIL;
     }
-    body[received] = '\0';
 
     char ssid[32] = {0};
     char pass[64] = {0};
@@ -379,15 +287,14 @@ static esp_err_t post_save_handler(httpd_req_t *req)
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing SSID");
         return ESP_FAIL;
     }
-    form_field(body, "pass", pass, sizeof(pass)); // password can be empty
+    form_field(body, "pass", pass, sizeof(pass));
 
+    ESP_LOGI(TAG, "Saving SSID=%s — restarting", ssid);
     nvs_save_credentials(ssid, pass);
 
-    const char *resp = "<h3>Saved! Restarting...</h3>";
     httpd_resp_set_type(req, "text/html");
-    httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
-
-    vTaskDelay(pdMS_TO_TICKS(500)); // let response flush
+    httpd_resp_send(req, "<h3>Saved! Restarting...</h3>", HTTPD_RESP_USE_STRLEN);
+    vTaskDelay(pdMS_TO_TICKS(500));
     esp_restart();
     return ESP_OK;
 }
@@ -403,7 +310,7 @@ static void stop_http_server(void)
 
 static void start_http_server(void)
 {
-    if (s_http_server) return; // already running
+    if (s_http_server) return;
 
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.lru_purge_enable  = true;
@@ -415,72 +322,29 @@ static void start_http_server(void)
         return;
     }
 
-    // RFC 8908 Captive Portal API (MUST be registered before catch-all)
-    httpd_uri_t capport_api = {
-        .uri      = "/api",
-        .method   = HTTP_GET,
-        .handler  = api_captive_handler,
-    };
-    httpd_register_uri_handler(s_http_server, &capport_api);
+#define REGISTER(u, m, h) do { \
+        httpd_uri_t _r = {.uri=(u), .method=(m), .handler=(h)}; \
+        httpd_register_uri_handler(s_http_server, &_r); \
+    } while (0)
 
-    httpd_uri_t root = {
-        .uri      = "/",
-        .method   = HTTP_GET,
-        .handler  = get_root_handler,
-    };
-    httpd_uri_t save = {
-        .uri      = "/save",
-        .method   = HTTP_POST,
-        .handler  = post_save_handler,
-    };
-    // Android
-    httpd_uri_t gen204 = {
-        .uri      = "/generate_204",
-        .method   = HTTP_GET,
-        .handler  = android_generate_204_handler,
-    };
-    // Windows
-    httpd_uri_t connecttest = {
-        .uri      = "/connecttest.txt",
-        .method   = HTTP_GET,
-        .handler  = windows_connecttest_handler,
-    };
-    // Linux NetworkManager
-    httpd_uri_t nmcheck = {
-        .uri      = "/check_network_status.txt",
-        .method   = HTTP_GET,
-        .handler  = linux_nmcheck_handler,
-    };
-    // iOS / macOS
-    httpd_uri_t hotspot = {
-        .uri      = "/hotspot-detect.html",
-        .method   = HTTP_GET,
-        .handler  = ios_hotspot_handler,
-    };
+    REGISTER("/api",                     HTTP_GET,  api_captive_handler);        // RFC 8908
+    REGISTER("/",                        HTTP_GET,  portal_html_handler);
+    REGISTER("/save",                    HTTP_POST, post_save_handler);
+    REGISTER("/generate_204",            HTTP_GET,  portal_html_handler);        // Android
+    REGISTER("/hotspot-detect.html",     HTTP_GET,  portal_html_handler);        // iOS
+    REGISTER("/check_network_status.txt",HTTP_GET,  portal_html_handler);        // Linux NM
+    REGISTER("/connecttest.txt",         HTTP_GET,  windows_connecttest_handler); // Win11
+    REGISTER("/ncsi.txt",                HTTP_GET,  redirect_to_portal_handler);
+    REGISTER("/redirect",                HTTP_GET,  redirect_to_portal_handler);
+    REGISTER("/canonical.html",          HTTP_GET,  redirect_to_portal_handler);
+    REGISTER("/success.txt",             HTTP_GET,  redirect_to_portal_handler); // Firefox
+    REGISTER("/wpad.dat",                HTTP_GET,  not_found_handler);          // Win10
+    REGISTER("/favicon.ico",             HTTP_GET,  not_found_handler);
 
-    // Additional probe endpoints (see CDFER/Captive-Portal-ESP32)
-    httpd_uri_t wpad      = { .uri="/wpad.dat",        .method=HTTP_GET, .handler=wpad_404_handler };
-    httpd_uri_t favicon   = { .uri="/favicon.ico",     .method=HTTP_GET, .handler=favicon_404_handler };
-    httpd_uri_t success   = { .uri="/success.txt",     .method=HTTP_GET, .handler=success_txt_handler };
-    httpd_uri_t redirect  = { .uri="/redirect",        .method=HTTP_GET, .handler=portal_redirect_handler };
-    httpd_uri_t ncsi      = { .uri="/ncsi.txt",        .method=HTTP_GET, .handler=portal_redirect_handler };
-    httpd_uri_t canonical = { .uri="/canonical.html",  .method=HTTP_GET, .handler=portal_redirect_handler };
+#undef REGISTER
 
-    httpd_register_uri_handler(s_http_server, &root);
-    httpd_register_uri_handler(s_http_server, &save);
-    httpd_register_uri_handler(s_http_server, &gen204);
-    httpd_register_uri_handler(s_http_server, &connecttest);
-    httpd_register_uri_handler(s_http_server, &nmcheck);
-    httpd_register_uri_handler(s_http_server, &hotspot);
-    httpd_register_uri_handler(s_http_server, &wpad);
-    httpd_register_uri_handler(s_http_server, &favicon);
-    httpd_register_uri_handler(s_http_server, &success);
-    httpd_register_uri_handler(s_http_server, &redirect);
-    httpd_register_uri_handler(s_http_server, &ncsi);
-    httpd_register_uri_handler(s_http_server, &canonical);
-
-    // Redirect everything else to portal
-    httpd_register_err_handler(s_http_server, HTTPD_404_NOT_FOUND, captive_redirect_handler);
+    httpd_register_err_handler(s_http_server, HTTPD_404_NOT_FOUND,
+                               captive_redirect_handler);
 
     ESP_LOGI(TAG, "HTTP server started — open " AP_IP_URL);
 }
@@ -564,7 +428,6 @@ static void start_sta_mode(const char *ssid, const char *pass)
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_cfg));
     ESP_ERROR_CHECK(esp_wifi_start());
-    ESP_ERROR_CHECK(esp_wifi_connect());
 }
 
 // ── Event handler ─────────────────────────────────────────────────────────────
@@ -601,10 +464,6 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
                      esp_get_free_heap_size());
             break;
 
-        case WIFI_EVENT_AP_STADISCONNECTED:
-            ESP_LOGI(TAG, "A device left the setup AP");
-            break;
-
         default:
             break;
         }
@@ -623,35 +482,26 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
 }
 
 // ── wifi_manager_task ─────────────────────────────────────────────────────────
-// Runs once at startup: initialises WiFi, decides STA or AP, then exits.
-// All further lifecycle events are handled by wifi_event_handler.
 static void wifi_manager_task(void *arg)
 {
-    // netif + event loop must be created before esp_wifi_init
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
     wifi_init_config_t init_cfg = WIFI_INIT_CONFIG_DEFAULT();
-    // Android AMPDU RX bug workaround (same fix used in CDFER/Captive-Portal-ESP32)
-    init_cfg.ampdu_rx_enable = 0;
+    init_cfg.ampdu_rx_enable = 0;  // Android AMPDU RX bug workaround
     ESP_ERROR_CHECK(esp_wifi_init(&init_cfg));
 
-    // Register for all WiFi events and the "got IP" IP event
     ESP_ERROR_CHECK(esp_event_handler_instance_register(
-        WIFI_EVENT, ESP_EVENT_ANY_ID,  wifi_event_handler, NULL, NULL));
+        WIFI_EVENT, ESP_EVENT_ANY_ID,   wifi_event_handler, NULL, NULL));
     ESP_ERROR_CHECK(esp_event_handler_instance_register(
-        IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler, NULL, NULL));
+        IP_EVENT,   IP_EVENT_STA_GOT_IP, wifi_event_handler, NULL, NULL));
 
-    if (nvs_has_credentials()) {
-        char ssid[32] = {0};
-        char pass[64] = {0};
-        nvs_load_credentials(ssid, sizeof(ssid), pass, sizeof(pass));
+    char ssid[32] = {0}, pass[64] = {0};
+    if (nvs_load_credentials(ssid, sizeof(ssid), pass, sizeof(pass)))
         start_sta_mode(ssid, pass);
-    } else {
+    else
         start_ap_mode();
-    }
 
-    // Task's job is done — lifecycle continues in event handler
     vTaskDelete(NULL);
 }
 
