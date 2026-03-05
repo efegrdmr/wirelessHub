@@ -22,13 +22,6 @@
 
 static const char *TAG = "WiFiMgr";
 
-// Samsung + some Android versions require the AP IP to be in PUBLIC address space.
-// 4.3.2.1 is the same address used by the reference CDFER captive portal impl.
-#define AP_IP_STR     "4.3.2.1"
-#define AP_IP_URL     "http://4.3.2.1"
-#define AP_IP_API_URL "http://4.3.2.1/api"
-#define WIFI_CHANNEL  6
-
 // ── State ─────────────────────────────────────────────────────────────────────
 static EventGroupHandle_t s_event_group  = NULL;
 static httpd_handle_t     s_http_server  = NULL;
@@ -68,7 +61,7 @@ static void nvs_save_credentials(const char *ssid, const char *pass)
 }
 
 // ── DNS hijack ────────────────────────────────────────────────────────────────
-// Replies to every DNS query with AP_IP_STR so all domains point to the portal.
+// Replies to every DNS query with WIFI_AP_IP_STR so all domains point to the portal.
 static void dns_server_task(void *arg)
 {
     struct sockaddr_in addr = {
@@ -85,7 +78,7 @@ static void dns_server_task(void *arg)
     }
     ESP_LOGI(TAG, "DNS running on :53");
 
-    uint32_t ap_ip = inet_addr(AP_IP_STR);
+    uint32_t ap_ip = inet_addr(WIFI_AP_IP_STR);
     static uint8_t buf[512], resp[512];
 
     while (1) {
@@ -105,7 +98,7 @@ static void dns_server_task(void *arg)
             qname[qo++] = '.';
         }
         if (qo) qname[qo - 1] = '\0';
-        ESP_LOGI(TAG, "DNS %s -> " AP_IP_STR, qname);
+        ESP_LOGI(TAG, "DNS %s -> " WIFI_AP_IP_STR, qname);
 
         // Find end of question section
         int ne = 12;
@@ -337,7 +330,7 @@ static esp_err_t portal_html_handler(httpd_req_t *req)
 static esp_err_t redirect_to_portal_handler(httpd_req_t *req)
 {
     httpd_resp_set_status(req, "302 Found");
-    httpd_resp_set_hdr(req, "Location", AP_IP_URL);
+    httpd_resp_set_hdr(req, "Location", WIFI_AP_IP_URL);
     httpd_resp_send(req, NULL, 0);
     return ESP_OK;
 }
@@ -361,7 +354,7 @@ static esp_err_t not_found_handler(httpd_req_t *req)
 // RFC 8908 Captive Portal API — DHCP Option 114 points here
 static esp_err_t api_captive_handler(httpd_req_t *req)
 {
-    const char *json = "{\"captive\":true,\"user-portal-url\":\"" AP_IP_URL "/\"}";
+    const char *json = "{\"captive\":true,\"user-portal-url\":\"" WIFI_AP_IP_URL "/\"}";
     httpd_resp_set_type(req, "application/captive+json");
     httpd_resp_set_hdr(req, "Cache-Control", "private, no-store");
     httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
@@ -447,7 +440,7 @@ static void start_http_server(void)
     httpd_register_err_handler(s_http_server, HTTPD_404_NOT_FOUND,
                                captive_redirect_handler);
 
-    ESP_LOGI(TAG, "HTTP server started — open " AP_IP_URL);
+    ESP_LOGI(TAG, "HTTP server started — open " WIFI_AP_IP_URL);
 }
 
 // ── WiFi modes ────────────────────────────────────────────────────────────────
@@ -498,23 +491,26 @@ static void start_ap_mode(void)
         esp_netif_dhcps_option(ap_netif,
                                ESP_NETIF_OP_SET,
                                ESP_NETIF_CAPTIVEPORTAL_URI,
-                               (void *)AP_IP_API_URL,
-                               strlen(AP_IP_API_URL));
+                               (void *)WIFI_AP_IP_API_URL,
+                               strlen(WIFI_AP_IP_API_URL));
 
         esp_netif_dhcps_start(ap_netif);
-        ESP_LOGI(TAG, "DHCP: DNS=" AP_IP_STR ", CaptivePortal=" AP_IP_API_URL);
+        ESP_LOGI(TAG, "DHCP: DNS=" WIFI_AP_IP_STR ", CaptivePortal=" WIFI_AP_IP_API_URL);
     }
 
     start_http_server();
     start_dns_server();
 
-    xEventGroupClearBits(s_event_group, WIFI_READY_BIT);
-    xEventGroupSetBits(s_event_group, WIFI_LOST_BIT);
+    xEventGroupClearBits(s_event_group, WIFI_READY_BIT | WIFI_CONNECTING_BIT);
+    xEventGroupSetBits(s_event_group, WIFI_LOST_BIT | WIFI_AP_MODE_BIT);
 }
 
 static void start_sta_mode(const char *ssid, const char *pass)
 {
     ESP_LOGI(TAG, "Connecting to: %s", ssid);
+
+    xEventGroupClearBits(s_event_group, WIFI_AP_MODE_BIT | WIFI_AUTH_FAIL_BIT);
+    xEventGroupSetBits(s_event_group, WIFI_CONNECTING_BIT);
 
     if (!s_netif_sta_created) {
         esp_netif_create_default_wifi_sta();
@@ -544,13 +540,22 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
             break;
 
         case WIFI_EVENT_STA_DISCONNECTED: {
-            xEventGroupClearBits(s_event_group, WIFI_READY_BIT);
+            wifi_event_sta_disconnected_t *dc =
+                (wifi_event_sta_disconnected_t *)data;
+            xEventGroupClearBits(s_event_group, WIFI_READY_BIT | WIFI_CONNECTING_BIT);
             xEventGroupSetBits(s_event_group,   WIFI_LOST_BIT);
+
+            if (dc->reason == WIFI_REASON_AUTH_FAIL ||
+                dc->reason == WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT) {
+                ESP_LOGW(TAG, "Auth failure (reason=%d)", dc->reason);
+                xEventGroupSetBits(s_event_group, WIFI_AUTH_FAIL_BIT);
+            }
 
             s_retry_count++;
             if (s_retry_count <= WIFI_MAX_RETRY) {
                 ESP_LOGW(TAG, "Disconnected — retry %d/%d",
                          s_retry_count, WIFI_MAX_RETRY);
+                xEventGroupSetBits(s_event_group, WIFI_CONNECTING_BIT);
                 esp_wifi_connect();
             } else {
                 ESP_LOGE(TAG, "Max retries reached — falling back to AP mode");
@@ -577,8 +582,10 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
         stop_dns_server();
         stop_http_server();
 
-        xEventGroupClearBits(s_event_group, WIFI_LOST_BIT);
-        xEventGroupSetBits(s_event_group,   WIFI_READY_BIT);
+        xEventGroupClearBits(s_event_group,
+                             WIFI_LOST_BIT | WIFI_CONNECTING_BIT |
+                             WIFI_AP_MODE_BIT | WIFI_AUTH_FAIL_BIT);
+        xEventGroupSetBits(s_event_group, WIFI_READY_BIT);
     }
 }
 

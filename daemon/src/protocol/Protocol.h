@@ -1,17 +1,138 @@
 #pragma once
-#include <cstdint>
-#include <cstddef>
-#include <netinet/in.h>
-#include <arpa/inet.h>
 
-// ── Network constants ─────────────────────────────────────────────────────────
-static constexpr uint16_t DAEMON_PORT      = 7788;   // daemon listens here
-static constexpr uint16_t DEVICE_BASE_PORT = 7789;   // device_id N uses port 7789+N
-static constexpr size_t   MAX_PACKET       = 65536 + 6; // 6 = sizeof(Header)
-static constexpr size_t   MTU_PAYLOAD      = 1400;       // max payload per UDP datagram
+/*
+ * Protocol.h — shared wire protocol between the WirelessHub daemon (C++) and
+ * the ESP32 firmware (C).  The file is valid in both C11 and C++11 modes.
+ *
+ * All multi-byte fields on the wire are little-endian.
+ */
 
-// Build a sockaddr_in from a dotted-decimal IP string and port.
-// Pass nullptr or "" for INADDR_ANY.
+#ifdef __cplusplus
+#  include <cstdint>
+#  include <cstddef>
+#else
+#  include <stdint.h>
+#  include <stddef.h>
+#endif
+
+/* ── Network constants ───────────────────────────────────────────────────── */
+#define DAEMON_PORT       ((uint16_t)7788)   /* daemon listens here           */
+#define DEVICE_BASE_PORT  ((uint16_t)7789)   /* device_id N → port 7789+N     */
+#define MAX_PACKET        ((size_t)65542)    /* 65536 data + 6 header bytes   */
+#define MTU_PAYLOAD       ((size_t)1400)     /* max payload per UDP datagram  */
+
+/* ── CmdType values (use CMD_* in C; CmdType:: enum class available in C++) */
+#define CMD_DISCOVER        ((uint8_t)0x01)  /* device → daemon: broadcast, no payload */
+#define CMD_DISCOVER_REPLY  ((uint8_t)0x02)  /* daemon → device: unicast reply         */
+#define CMD_DEVICE_EVENT    ((uint8_t)0x10)  /* device connected / disconnected        */
+#define CMD_OPTIMIZED_DATA  ((uint8_t)0x20)
+#define CMD_RAW_DATA        ((uint8_t)0x30)  /* single-datagram USB/IP pass-through    */
+#define CMD_RAW_FRAG        ((uint8_t)0x31)  /* fragmented USB/IP (payload > MTU)      */
+#define CMD_ACK             ((uint8_t)0x40)
+#define CMD_ERROR           ((uint8_t)0xFF)
+
+/* ── DeviceId values ─────────────────────────────────────────────────────── */
+#define DEVICE_ID_USB0      ((uint8_t)0x00)
+#define DEVICE_ID_USB1      ((uint8_t)0x01)
+#define DEVICE_ID_USB2      ((uint8_t)0x02)
+#define DEVICE_ID_USB3      ((uint8_t)0x03)
+#define DEVICE_ID_ETHERNET  ((uint8_t)0x04)
+
+/* ── DeviceEvent values ──────────────────────────────────────────────────── */
+#define DEVICE_EVENT_CONNECT    ((uint8_t)0x01)
+#define DEVICE_EVENT_DISCONNECT ((uint8_t)0x02)
+
+/* ── UsbSpeed values ─────────────────────────────────────────────────────── */
+#define USB_SPEED_LOW   ((uint8_t)0x01)
+#define USB_SPEED_FULL  ((uint8_t)0x02)
+#define USB_SPEED_HIGH  ((uint8_t)0x03)
+
+/* ── Packed wire structs (C and C++) ─────────────────────────────────────── */
+
+/* 6-byte packet header */
+typedef struct {
+    uint8_t  cmd_type;
+    uint8_t  device_id;    /* DEVICE_ID_* */
+    uint8_t  endpoint;
+    uint8_t  seq;
+    uint16_t payload_len;
+} __attribute__((packed)) Header;
+
+/* Payload for CMD_DISCOVER_REPLY — daemon sends this unicast back.
+ * ESP learns daemon IP from UDP sender address; daemon_port is redundant
+ * but kept for completeness (equals DAEMON_PORT). */
+typedef struct {
+    uint16_t daemon_port;  /* little-endian */
+} __attribute__((packed)) DiscoverReplyPayload;
+
+/* Payload for CMD_DEVICE_EVENT */
+typedef struct {
+    uint8_t  device_id;   /* mirrors Header::device_id  */
+    uint8_t  event;       /* DEVICE_EVENT_*             */
+    uint8_t  speed;       /* USB_SPEED_*                */
+    uint8_t  usb_class;
+    uint8_t  subclass;
+    uint8_t  protocol;
+    uint16_t reply_port;  /* UDP port on device side for daemon responses */
+} __attribute__((packed)) DeviceEventPayload;
+
+/* Follows the 6-byte Header when cmd_type == CMD_RAW_FRAG */
+typedef struct {
+    uint16_t transfer_seq; /* rolling counter per device identifying the transfer */
+    uint8_t  frag_idx;     /* 0-based index of this fragment                      */
+    uint8_t  frag_total;   /* total number of fragments for this transfer         */
+} __attribute__((packed)) FragHeader;
+
+/* ── Static assertions ───────────────────────────────────────────────────── */
+#ifdef __cplusplus
+  static_assert(sizeof(Header)               == 6, "Header must be 6 bytes");
+  static_assert(sizeof(DiscoverReplyPayload)  == 2, "DiscoverReplyPayload must be 2 bytes");
+  static_assert(sizeof(DeviceEventPayload)    == 8, "DeviceEventPayload must be 8 bytes");
+  static_assert(sizeof(FragHeader)            == 4, "FragHeader must be 4 bytes");
+#else
+  _Static_assert(sizeof(Header)               == 6, "Header must be 6 bytes");
+  _Static_assert(sizeof(DiscoverReplyPayload)  == 2, "DiscoverReplyPayload must be 2 bytes");
+  _Static_assert(sizeof(DeviceEventPayload)    == 8, "DeviceEventPayload must be 8 bytes");
+  _Static_assert(sizeof(FragHeader)            == 4, "FragHeader must be 4 bytes");
+#endif
+
+/* ── C++ extras: enum class wrappers and makeAddr() helper ──────────────── */
+#ifdef __cplusplus
+#  include <netinet/in.h>
+#  include <arpa/inet.h>
+
+enum class CmdType : uint8_t {
+    DISCOVER        = CMD_DISCOVER,
+    DISCOVER_REPLY  = CMD_DISCOVER_REPLY,
+    DEVICE_EVENT    = CMD_DEVICE_EVENT,
+    OPTIMIZED_DATA  = CMD_OPTIMIZED_DATA,
+    RAW_DATA        = CMD_RAW_DATA,
+    RAW_FRAG        = CMD_RAW_FRAG,
+    ACK             = CMD_ACK,
+    ERROR           = CMD_ERROR
+};
+
+enum class DeviceId : uint8_t {
+    USB0     = DEVICE_ID_USB0,
+    USB1     = DEVICE_ID_USB1,
+    USB2     = DEVICE_ID_USB2,
+    USB3     = DEVICE_ID_USB3,
+    ETHERNET = DEVICE_ID_ETHERNET
+};
+
+enum class DeviceEvent : uint8_t {
+    CONNECT    = DEVICE_EVENT_CONNECT,
+    DISCONNECT = DEVICE_EVENT_DISCONNECT
+};
+
+enum class UsbSpeed : uint8_t {
+    LOW  = USB_SPEED_LOW,
+    FULL = USB_SPEED_FULL,
+    HIGH = USB_SPEED_HIGH
+};
+
+/* Build a sockaddr_in from a dotted-decimal IP string and port.
+ * Pass nullptr or "" for INADDR_ANY. */
 inline sockaddr_in makeAddr(const char* ip, uint16_t port)
 {
     sockaddr_in addr{};
@@ -24,80 +145,4 @@ inline sockaddr_in makeAddr(const char* ip, uint16_t port)
     return addr;
 }
 
-// 6-byte packet header (all multi-byte fields are little-endian)
-struct Header
-{
-    uint8_t  cmd_type;
-    uint8_t  device_id;    // 0x00-0x03 = USB ports 0-3, 0x04 = Ethernet
-    uint8_t  endpoint;
-    uint8_t  seq;
-    uint16_t payload_len;
-} __attribute__((packed));
-
-static_assert(sizeof(Header) == 6, "Header must be 6 bytes");
-
-// Payload for CmdType::DISCOVER_REPLY
-// Daemon sends this unicast to the device that issued a DISCOVER broadcast.
-// Device learns daemon IP from UDP sender address; port is here for completeness.
-struct DiscoverReplyPayload
-{
-    uint16_t daemon_port;  // DAEMON_PORT, little-endian
-} __attribute__((packed));
-
-static_assert(sizeof(DiscoverReplyPayload) == 2, "DiscoverReplyPayload must be 2 bytes");
-
-enum class CmdType : uint8_t {
-    DISCOVER         = 0x01,  // device → daemon: broadcast discovery request (no payload)
-    DISCOVER_REPLY   = 0x02,  // daemon → device: unicast reply
-    DEVICE_EVENT     = 0x10,  // device connected/disconnected
-    OPTIMIZED_DATA   = 0x20,
-    RAW_DATA         = 0x30,  // single-datagram USB/IP pass-through
-    RAW_FRAG         = 0x31,  // fragmented USB/IP pass-through (payload > MTU_PAYLOAD)
-    ACK              = 0x40,
-    ERROR            = 0xFF
-};
-
-// device_id constants
-enum class DeviceId : uint8_t {
-    USB0     = 0x00,
-    USB1     = 0x01,
-    USB2     = 0x02,
-    USB3     = 0x03,
-    ETHERNET = 0x04
-};
-
-enum class DeviceEvent : uint8_t {
-    CONNECT    = 0x01,
-    DISCONNECT = 0x02
-};
-
-enum class UsbSpeed : uint8_t {
-    LOW  = 0x01,
-    FULL = 0x02,
-    HIGH = 0x03
-};
-
-// Payload for CmdType::DEVICE_EVENT
-struct DeviceEventPayload
-{
-    uint8_t  device_id;   // mirrors Header::device_id
-    uint8_t  event;       // DeviceEvent
-    uint8_t  speed;       // UsbSpeed
-    uint8_t  usb_class;
-    uint8_t  subclass;
-    uint8_t  protocol;
-    uint16_t reply_port;  // UDP port on device side for responses
-} __attribute__((packed));
-
-static_assert(sizeof(DeviceEventPayload) == 8, "DeviceEventPayload must be 8 bytes");
-
-// Follows the 6-byte Header when cmd_type == RAW_FRAG.
-// Allows reassembly of USB/IP transfers larger than MTU_PAYLOAD.
-struct FragHeader
-{
-    uint16_t transfer_seq; // per-device rolling counter identifying the transfer
-    uint8_t  frag_idx;     // 0-based index of this fragment
-    uint8_t  frag_total;   // total number of fragments for this transfer
-} __attribute__((packed));
-
-static_assert(sizeof(FragHeader) == 4, "FragHeader must be 4 bytes");
+#endif /* __cplusplus */

@@ -1,4 +1,5 @@
 #include "wifi_manager.h"
+#include "hub_client.h"
 
 #include "esp_log.h"
 #include "nvs_flash.h"
@@ -21,12 +22,8 @@ void app_main(void)
     ESP_LOGI(TAG, "Starting WiFi manager");
     wifi_manager_start();
 
-    // ── Future tasks go here ───────────────────────────────────────────────
-    // Wait for WiFi before starting anything network-dependent:
-    //
-    //   EventGroupHandle_t eg = wifi_manager_event_group();
-    //   xEventGroupWaitBits(eg, WIFI_READY_BIT, pdFALSE, pdTRUE, portMAX_DELAY);
-    //   ESP_LOGI(TAG, "WiFi ready — starting hub task");
-    //   xTaskCreate(hub_task, "hub", 8192, NULL, 5, NULL);
-    // ──────────────────────────────────────────────────────────────────────
+    // Discover the daemon on the local network as soon as WiFi is ready.
+    // hub_client_start() spawns a FreeRTOS task that waits for WIFI_READY_BIT
+    // internally, so it is safe to call here unconditionally.
+    hub_client_start();
 }
