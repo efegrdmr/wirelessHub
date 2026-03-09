@@ -1,5 +1,6 @@
 #include "wifi_manager.h"
 #include "hub_client.h"
+#include "eth_passthrough.h"
 
 #include "esp_log.h"
 #include "nvs_flash.h"
@@ -26,4 +27,10 @@ void app_main(void)
     // hub_client_start() spawns a FreeRTOS task that waits for WIFI_READY_BIT
     // internally, so it is safe to call here unconditionally.
     hub_client_start();
+
+    // Start Ethernet passthrough: raw frames from W5500 are tunnelled to
+    // the daemon's TAP interface.  The session tasks wait for DAEMON_FOUND_BIT
+    // before opening any sockets, so ordering relative to hub_client_start()
+    // only matters for clarity.
+    eth_passthrough_start();
 }

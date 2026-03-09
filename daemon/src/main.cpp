@@ -1,5 +1,7 @@
 #include "usbip/VhciDriver.h"
 #include "network/HubServer.h"
+#include "network/TapDevice.h"
+#include "protocol/Protocol.h"
 
 #include <cstdio>
 #include <cstring>
@@ -42,14 +44,16 @@ int main()
     VhciDriver vhci;
     if (!vhci.init()) { fprintf(stderr, "[main] VhciDriver init failed\n"); return 1; }
 
+    TapDevice tap;
+
     int epfd = epoll_create1(EPOLL_CLOEXEC);
     if (epfd < 0) { perror("[main] epoll_create1"); return 1; }
 
     HubServer hub;
     epollAdd(epfd, hub.udpFd(), EPOLLIN);
 
-    // ── Helper: socketpair + vhci.attach + hub.addSession + epollAdd ─────────
-    auto doAttach = [&](uint8_t dev_id, uint8_t speed, const sockaddr_in& dev_addr)
+    // ── Helper: socketpair + vhci.attach + hub.addSession + epollAdd (USB) ──
+    auto doUsbAttach = [&](uint8_t dev_id, uint8_t speed, const sockaddr_in& dev_addr)
     {
         int spv[2];
         if (::socketpair(AF_UNIX, SOCK_STREAM, 0, spv) < 0) {
@@ -61,16 +65,38 @@ int main()
             fprintf(stderr, "[main] vhci.attach() failed for device_id=0x%02X\n", dev_id);
             ::close(spv[0]); ::close(spv[1]); return;
         }
-        printf("[main] device_id=0x%02X attached on vhci port=%d  vhci_fd=%d\n",
+        printf("[main] USB device_id=0x%02X attached on vhci port=%d  vhci_fd=%d\n",
                dev_id, port, spv[1]);
         hub.addSession(dev_id, port, spv[1], spv[0], dev_addr);
         epollAdd(epfd, spv[1], EPOLLIN | EPOLLRDHUP);
     };
 
+    // ── Helper: TAP open + hub.addSession + epollAdd (Ethernet) ─────────────
+    auto doEthAttach = [&](uint8_t dev_id, const sockaddr_in& dev_addr)
+    {
+        if (tap.isOpen()) {
+            fprintf(stderr, "[main] TAP already open, ignoring duplicate CONNECT\n");
+            return;
+        }
+        if (!tap.open("wh_eth0")) {
+            fprintf(stderr, "[main] TapDevice::open() failed\n");
+            return;
+        }
+        int tap_fd = tap.release();   // DeviceSession RAII takes ownership
+        // vhci_port = -1 signals "TAP session, no VHCI" to the event loop
+        hub.addSession(dev_id, /*vhci_port=*/-1, /*vhci_fd=*/tap_fd,
+                       /*kernel_fd=*/-1, dev_addr);
+        epollAdd(epfd, tap_fd, EPOLLIN);
+        printf("[main] Ethernet TAP wh_eth0 (fd=%d) session active\n", tap_fd);
+    };
+
     // ── Callbacks ─────────────────────────────────────────────────────────────
     hub.setConnectCallback([&](uint8_t dev_id, uint8_t speed, sockaddr_in dev_addr)
     {
-        doAttach(dev_id, speed, dev_addr);
+        if (dev_id == DEVICE_ID_ETHERNET)
+            doEthAttach(dev_id, dev_addr);
+        else
+            doUsbAttach(dev_id, speed, dev_addr);
     });
 
     hub.setDisconnectCallback([&](uint8_t dev_id)
@@ -78,7 +104,8 @@ int main()
         DeviceSession* s = hub.findByDeviceId(dev_id);
         if (!s) return;
         epollDel(epfd, s->vhci_fd);
-        vhci.detach(s->vhci_port);
+        if (s->vhci_port >= 0)
+            vhci.detach(s->vhci_port);   // USB only
         hub.removeSession(dev_id);  // RAII closes fds
     });
 
@@ -108,16 +135,24 @@ int main()
             if (!s) continue;
 
             if (evts & (EPOLLHUP | EPOLLRDHUP | EPOLLERR)) {
-                // USB reset — re-attach same device
-                printf("[main] USB reset for device_id=0x%02X (vhci_fd=%d), re-attaching\n",
-                       s->device_id, ev_fd);
-                uint8_t     dev_id   = s->device_id;
-                sockaddr_in dev_addr = s->dev_addr;
-
-                epollDel(epfd, ev_fd);
-                vhci.freePort(s->vhci_port);
-                hub.removeSession(dev_id);     // RAII closes fds
-                doAttach(dev_id, /*speed=*/2, dev_addr);
+                if (s->vhci_port >= 0) {
+                    // USB reset — re-attach same device
+                    printf("[main] USB reset for device_id=0x%02X (vhci_fd=%d), re-attaching\n",
+                           s->device_id, ev_fd);
+                    uint8_t     dev_id   = s->device_id;
+                    sockaddr_in dev_addr = s->dev_addr;
+                    epollDel(epfd, ev_fd);
+                    vhci.freePort(s->vhci_port);
+                    hub.removeSession(dev_id);
+                    doUsbAttach(dev_id, /*speed=*/2, dev_addr);
+                } else {
+                    // TAP EOF — just remove session (ESP32 will re-CONNECT)
+                    printf("[main] TAP EOF for device_id=0x%02X, removing session\n",
+                           s->device_id);
+                    uint8_t dev_id = s->device_id;
+                    epollDel(epfd, ev_fd);
+                    hub.removeSession(dev_id);
+                }
                 continue;
             }
 
