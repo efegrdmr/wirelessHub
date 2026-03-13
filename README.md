@@ -1,5 +1,7 @@
 # WirelessHub
 
+![System Overview](images/image.jpeg)
+
 WirelessHub enables wireless keyboard and mouse connectivity between your computer and a remote device. The project consists of two main parts:
 
 - **daemon/** (C++):
