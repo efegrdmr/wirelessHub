@@ -1,9 +1,16 @@
 #include "wifi_manager.h"
 #include "hub_client.h"
+#include "log_forwarder.h"
+#include "crash_reporter.h"
 #include "eth_passthrough.h"
+#include "usb_passthrough.h"
 
 #include "esp_log.h"
 #include "nvs_flash.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+#include "esp_system.h"
 
 static const char *TAG = "Main";
 
@@ -20,17 +27,20 @@ void app_main(void)
         ESP_ERROR_CHECK(err);
     }
 
+    /* Small delay so the serial monitor has time to connect before
+       early init logs scroll past. Remove after debugging. */
+    vTaskDelay(pdMS_TO_TICKS(2000));
+
     ESP_LOGI(TAG, "Starting WiFi manager");
     wifi_manager_start();
 
-    // Discover the daemon on the local network as soon as WiFi is ready.
-    // hub_client_start() spawns a FreeRTOS task that waits for WIFI_READY_BIT
-    // internally, so it is safe to call here unconditionally.
     hub_client_start();
 
-    // Start Ethernet passthrough: raw frames from W5500 are tunnelled to
-    // the daemon's TAP interface.  The session tasks wait for DAEMON_FOUND_BIT
-    // before opening any sockets, so ordering relative to hub_client_start()
-    // only matters for clarity.
+    // log_forwarder must come before crash_reporter so crash reports go to daemon
+    log_forwarder_init();
+    ESP_LOGI(TAG, "Reboot detected. Reset reason: %d", esp_reset_reason());
+    crash_reporter_init();
+
     eth_passthrough_start();
+    usb_passthrough_start();
 }

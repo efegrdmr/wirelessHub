@@ -41,6 +41,8 @@ typedef struct {
     uint8_t             usb_class;   // USB class code (Ethernet → 0x02 CDC)
     uint8_t             subclass;
     uint8_t             protocol;
+    bool                usbip_mode;  // true → USB/IP proxy (parse CMD_SUBMIT, send RET_SUBMIT)
+                                    // false → raw relay (Ethernet TAP passthrough)
     const device_ops_t *ops;
 } device_session_cfg_t;
 

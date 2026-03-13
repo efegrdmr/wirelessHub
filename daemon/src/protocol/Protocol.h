@@ -29,7 +29,15 @@
 #define CMD_RAW_DATA        ((uint8_t)0x30)  /* single-datagram USB/IP pass-through    */
 #define CMD_RAW_FRAG        ((uint8_t)0x31)  /* fragmented USB/IP (payload > MTU)      */
 #define CMD_ACK             ((uint8_t)0x40)
+#define CMD_LOG             ((uint8_t)0x50)  /* device → daemon: ESP log line forwarding  */
 #define CMD_ERROR           ((uint8_t)0xFF)
+
+/* ── LogLevel values (payload byte 0 of CMD_LOG) ────────────────────────── */
+#define LOG_LEVEL_ERROR    ((uint8_t)0x01)  /* 'E' — ESP_LOGE */
+#define LOG_LEVEL_WARN     ((uint8_t)0x02)  /* 'W' — ESP_LOGW */
+#define LOG_LEVEL_INFO     ((uint8_t)0x03)  /* 'I' — ESP_LOGI */
+#define LOG_LEVEL_DEBUG    ((uint8_t)0x04)  /* 'D' — ESP_LOGD */
+#define LOG_LEVEL_VERBOSE  ((uint8_t)0x05)  /* 'V' — ESP_LOGV */
 
 /* ── DeviceId values ─────────────────────────────────────────────────────── */
 #define DEVICE_ID_USB0      ((uint8_t)0x00)
@@ -83,17 +91,28 @@ typedef struct {
     uint8_t  frag_total;   /* total number of fragments for this transfer         */
 } __attribute__((packed)) FragHeader;
 
+/* Payload for CMD_LOG — device → daemon log forwarding.
+ * The fixed byte `log_level` is followed immediately by a NUL-terminated
+ * (or length-delimited via Header::payload_len) UTF-8 log string.
+ * Total payload is always ≤ MTU_PAYLOAD so it fits in one datagram. */
+typedef struct {
+    uint8_t log_level;   /* LOG_LEVEL_* */
+    /* char msg[]; — variable-length, read via payload_len - 1 */
+} __attribute__((packed)) LogPayload;
+
 /* ── Static assertions ───────────────────────────────────────────────────── */
 #ifdef __cplusplus
   static_assert(sizeof(Header)               == 6, "Header must be 6 bytes");
   static_assert(sizeof(DiscoverReplyPayload)  == 2, "DiscoverReplyPayload must be 2 bytes");
   static_assert(sizeof(DeviceEventPayload)    == 8, "DeviceEventPayload must be 8 bytes");
   static_assert(sizeof(FragHeader)            == 4, "FragHeader must be 4 bytes");
+  static_assert(sizeof(LogPayload)            == 1, "LogPayload must be 1 byte");
 #else
   _Static_assert(sizeof(Header)               == 6, "Header must be 6 bytes");
   _Static_assert(sizeof(DiscoverReplyPayload)  == 2, "DiscoverReplyPayload must be 2 bytes");
   _Static_assert(sizeof(DeviceEventPayload)    == 8, "DeviceEventPayload must be 8 bytes");
   _Static_assert(sizeof(FragHeader)            == 4, "FragHeader must be 4 bytes");
+  _Static_assert(sizeof(LogPayload)            == 1, "LogPayload must be 1 byte");
 #endif
 
 /* ── C++ extras: enum class wrappers and makeAddr() helper ──────────────── */
@@ -109,6 +128,7 @@ enum class CmdType : uint8_t {
     RAW_DATA        = CMD_RAW_DATA,
     RAW_FRAG        = CMD_RAW_FRAG,
     ACK             = CMD_ACK,
+    LOG             = CMD_LOG,
     ERROR           = CMD_ERROR
 };
 

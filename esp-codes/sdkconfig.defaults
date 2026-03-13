@@ -8,3 +8,26 @@ CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=4096
 # Allocate mbedTLS buffers dynamically (only when a session is active)
 # instead of statically at startup — saves heap when no client is connected.
 CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
+
+# Enable W5500 SPI Ethernet driver
+CONFIG_ETH_USE_SPI_ETHERNET=y
+CONFIG_ETH_SPI_ETHERNET_W5500=y
+
+# Enable USB Host stack + hub support
+CONFIG_USB_OTG_SUPPORTED=y
+CONFIG_USB_HOST_HUBS_SUPPORTED=y
+
+# Disable USB Serial/JTAG — it shares the same D+/D- PHY (GPIO19/20) as USB OTG Host.
+# When USJ is enabled the PHY is claimed by the JTAG driver and usb_host never
+# sees device connect events (USB_HOST_CLIENT_EVENT_NEW_DEV never fires).
+CONFIG_USJ_ENABLE_USB_SERIAL_JTAG=n
+
+# Also disable the secondary console over USB Serial/JTAG — it silently
+# re-enables the USJ peripheral and grabs the PHY even when the primary
+# console is UART.
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
+
+# Longer USB reset timing — some hubs need more time to respond
+CONFIG_USB_HOST_RESET_HOLD_MS=100
+CONFIG_USB_HOST_RESET_RECOVERY_MS=100
+CONFIG_USB_HOST_SET_ADDR_RECOVERY_MS=30

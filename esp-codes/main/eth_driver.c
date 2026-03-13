@@ -163,7 +163,11 @@ static bool real_init(void)
         .quadwp_io_num = -1,
         .quadhd_io_num = -1,
     };
-    ESP_ERROR_CHECK(spi_bus_initialize(ETH_SPI_HOST, &buscfg, SPI_DMA_CH_AUTO));
+    esp_err_t ret = spi_bus_initialize(ETH_SPI_HOST, &buscfg, SPI_DMA_CH_AUTO);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "spi_bus_initialize failed: %s", esp_err_to_name(ret));
+        return false;
+    }
 
     /* ── W5500 MAC (SPI) ── */
     spi_device_interface_config_t devcfg = {
@@ -175,7 +179,8 @@ static bool real_init(void)
         .queue_size       = 20,
     };
     eth_w5500_config_t w5500_cfg = ETH_W5500_DEFAULT_CONFIG(ETH_SPI_HOST, &devcfg);
-    w5500_cfg.int_gpio_num = ETH_PIN_INT;
+    w5500_cfg.int_gpio_num  = ETH_PIN_INT;   /* -1 = not connected, use polling */
+    w5500_cfg.poll_period_ms = (ETH_PIN_INT == -1) ? 10 : 0;
 
     eth_mac_config_t mac_cfg = ETH_MAC_DEFAULT_CONFIG();
     esp_eth_mac_t   *mac     = esp_eth_mac_new_w5500(&w5500_cfg, &mac_cfg);
