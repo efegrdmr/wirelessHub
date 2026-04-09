@@ -161,11 +161,8 @@ void HubServer::onTcpReadable(int client_fd)
                               (dep.speed == USB_SPEED_FULL) ? "full" :
                               (dep.speed == USB_SPEED_HIGH) ? "high" : "?";
 
-            if (dep.device_id == DEVICE_ID_ETHERNET)
-                LOG_INFO("[HubServer] CONNECT  dev_id=0x%02X (Ethernet) over TCP", dep.device_id);
-            else
-                LOG_INFO("[HubServer] CONNECT  dev_id=0x%02X  speed=%s over TCP  class=%02X/%02X/%02X",
-                         dep.device_id, spd, dep.usb_class, dep.subclass, dep.protocol);
+            LOG_INFO("[HubServer] CONNECT  dev_id=0x%02X  speed=%s over TCP  class=%02X/%02X/%02X",
+                     dep.device_id, spd, dep.usb_class, dep.subclass, dep.protocol);
 
             if (findByDeviceId(dep.device_id)) {
                 LOG_WARN("[HubServer] dev_id=0x%02X already has a session — closing old one first", dep.device_id);

@@ -2,8 +2,9 @@
 #include "hub_client.h"
 #include "log_forwarder.h"
 #include "crash_reporter.h"
-#include "eth_passthrough.h"
-#include "usb_passthrough.h"
+#include "device_session.h"
+#include "usb_driver.h"
+#include "Protocol.h"
 
 #include "esp_log.h"
 #include "nvs_flash.h"
@@ -41,6 +42,14 @@ void app_main(void)
     ESP_LOGI(TAG, "Reboot detected. Reset reason: %d", esp_reset_reason());
     crash_reporter_init();
 
-    eth_passthrough_start();
-    usb_passthrough_start();
+    static const device_session_cfg_t usb_cfg = {
+        .device_id  = DEVICE_ID_USB0,
+        .speed      = USB_SPEED_FULL,
+        .usb_class  = 0x00,
+        .subclass   = 0x00,
+        .protocol   = 0x00,
+        .usbip_mode = true,
+        .ops        = &USB_DRIVER_OPS,
+    };
+    device_session_start(&usb_cfg);
 }

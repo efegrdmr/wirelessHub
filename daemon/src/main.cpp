@@ -1,6 +1,5 @@
 #include "usbip/VhciDriver.h"
 #include "network/HubServer.h"
-#include "network/TapDevice.h"
 #include "protocol/Protocol.h"
 #include "Log.h"
 
@@ -45,8 +44,6 @@ int main()
     VhciDriver vhci;
     if (!vhci.init()) { LOG_ERR("[main] VhciDriver init failed"); return 1; }
 
-    TapDevice tap;
-
     int epfd = epoll_create1(EPOLL_CLOEXEC);
     if (epfd < 0) { LOG_ERR("[main] epoll_create1: %s", strerror(errno)); return 1; }
 
@@ -86,44 +83,10 @@ int main()
         epollAdd(epfd, spv[1], EPOLLIN | EPOLLRDHUP);
     };
 
-    // ── Helper: TAP open + hub.addSession + epollAdd (Ethernet) ─────────────
-    auto doEthAttach = [&](uint8_t dev_id, const sockaddr_in& dev_addr)
-    {
-        if (tap.isOpen()) {
-            LOG_WARN("[main] TAP already open, ignoring duplicate CONNECT for dev_id=0x%02X", dev_id);
-            return;
-        }
-        if (!tap.open("wh_eth0")) {
-            LOG_ERR("[main] TapDevice::open() failed");
-            return;
-        }
-        int tap_fd = tap.release();   // DeviceSession RAII takes ownership
-        
-        // Extract the pending TCP socket via the "fake addr" hack implemented in HubServer
-        int client_fd = ntohs(dev_addr.sin_port); 
-        auto tcp_sock = hub.extractPendingSocket(client_fd);
-        if (!tcp_sock) {
-            LOG_ERR("[main] could not extract pending TCP socket for fd=%d", client_fd);
-            ::close(tap_fd); return;
-        }
-        
-        // Register the new TCP socket in epoll
-        epollAdd(epfd, tcp_sock->fd(), EPOLLIN | EPOLLRDHUP);
-        
-        // vhci_port = -1 signals "TAP session, no VHCI" to the event loop
-        hub.addSession(dev_id, /*vhci_port=*/-1, /*vhci_fd=*/tap_fd,
-                       /*kernel_fd=*/-1, dev_addr, std::move(tcp_sock));
-        epollAdd(epfd, tap_fd, EPOLLIN);
-        LOG_INFO("[main] Ethernet TAP wh_eth0 open (fd=%d) — dev_id=0x%02X session active over TCP", tap_fd, dev_id);
-    };
-
     // ── Callbacks ─────────────────────────────────────────────────────────────
     hub.setConnectCallback([&](uint8_t dev_id, uint8_t speed, sockaddr_in dev_addr)
     {
-        if (dev_id == DEVICE_ID_ETHERNET)
-            doEthAttach(dev_id, dev_addr);
-        else
-            doUsbAttach(dev_id, speed, dev_addr);
+        doUsbAttach(dev_id, speed, dev_addr);
     });
 
     hub.setDisconnectCallback([&](uint8_t dev_id)
@@ -226,13 +189,6 @@ int main()
                                 close(spv[0]); close(spv[1]);
                             }
                         }
-                    } else {
-                        // TAP EOF — just remove session (ESP32 will re-CONNECT)
-                        LOG_WARN("[main] TAP EOF  dev_id=0x%02X  fd=%d — session removed",
-                                 s->device_id, ev_fd);
-                        uint8_t dev_id = s->device_id;
-                        epollDel(epfd, ev_fd);
-                        hub.removeSession(dev_id);
                     }
                     continue;
                 }

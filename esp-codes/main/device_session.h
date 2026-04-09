@@ -17,7 +17,7 @@
 #define SESSION_LOST_BIT    BIT1
 
 // ── Device ops ────────────────────────────────────────────────────────────────
-// Implemented by the physical driver (eth_driver, usb_host, etc.).
+// Implemented by the physical driver (usb_driver, etc.).
 // All calls happen from dedicated FreeRTOS tasks — they MAY block.
 //
 // recv() contract:
@@ -36,13 +36,12 @@ typedef struct {
 
 // ── Session configuration ─────────────────────────────────────────────────────
 typedef struct {
-    uint8_t             device_id;   // DEVICE_ID_ETHERNET, DEVICE_ID_USB0, etc.
+    uint8_t             device_id;   // DEVICE_ID_USB0, DEVICE_ID_USB1, etc.
     uint8_t             speed;       // USB_SPEED_* constant (Ethernet → USB_SPEED_HIGH)
     uint8_t             usb_class;   // USB class code (Ethernet → 0x02 CDC)
     uint8_t             subclass;
     uint8_t             protocol;
     bool                usbip_mode;  // true → USB/IP proxy (parse CMD_SUBMIT, send RET_SUBMIT)
-                                    // false → raw relay (Ethernet TAP passthrough)
     const device_ops_t *ops;
 } device_session_cfg_t;
 

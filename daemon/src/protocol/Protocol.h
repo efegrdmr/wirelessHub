@@ -25,10 +25,8 @@
 #define CMD_DISCOVER        ((uint8_t)0x01)  /* device → daemon: broadcast, no payload */
 #define CMD_DISCOVER_REPLY  ((uint8_t)0x02)  /* daemon → device: unicast reply         */
 #define CMD_DEVICE_EVENT    ((uint8_t)0x10)  /* device connected / disconnected        */
-#define CMD_OPTIMIZED_DATA  ((uint8_t)0x20)
 #define CMD_RAW_DATA        ((uint8_t)0x30)  /* single-datagram USB/IP pass-through    */
 #define CMD_RAW_FRAG        ((uint8_t)0x31)  /* fragmented USB/IP (payload > MTU)      */
-#define CMD_ACK             ((uint8_t)0x40)
 #define CMD_LOG             ((uint8_t)0x50)  /* device → daemon: ESP log line forwarding  */
 #define CMD_ERROR           ((uint8_t)0xFF)
 
@@ -44,7 +42,6 @@
 #define DEVICE_ID_USB1      ((uint8_t)0x01)
 #define DEVICE_ID_USB2      ((uint8_t)0x02)
 #define DEVICE_ID_USB3      ((uint8_t)0x03)
-#define DEVICE_ID_ETHERNET  ((uint8_t)0x04)
 
 /* ── DeviceEvent values ──────────────────────────────────────────────────── */
 #define DEVICE_EVENT_CONNECT    ((uint8_t)0x01)
@@ -124,20 +121,17 @@ enum class CmdType : uint8_t {
     DISCOVER        = CMD_DISCOVER,
     DISCOVER_REPLY  = CMD_DISCOVER_REPLY,
     DEVICE_EVENT    = CMD_DEVICE_EVENT,
-    OPTIMIZED_DATA  = CMD_OPTIMIZED_DATA,
     RAW_DATA        = CMD_RAW_DATA,
     RAW_FRAG        = CMD_RAW_FRAG,
-    ACK             = CMD_ACK,
     LOG             = CMD_LOG,
     ERROR           = CMD_ERROR
 };
 
 enum class DeviceId : uint8_t {
-    USB0     = DEVICE_ID_USB0,
-    USB1     = DEVICE_ID_USB1,
-    USB2     = DEVICE_ID_USB2,
-    USB3     = DEVICE_ID_USB3,
-    ETHERNET = DEVICE_ID_ETHERNET
+    USB0 = DEVICE_ID_USB0,
+    USB1 = DEVICE_ID_USB1,
+    USB2 = DEVICE_ID_USB2,
+    USB3 = DEVICE_ID_USB3
 };
 
 enum class DeviceEvent : uint8_t {
